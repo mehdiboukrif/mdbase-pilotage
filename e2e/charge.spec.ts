@@ -210,7 +210,7 @@ test('remplir : une ligne par rôle, l’aperçu dans la grille, puis les affect
   await panneau.getByRole('button', { name: 'Créer dans Option B' }).click()
   await expect.poll(async () => (await espace.lister('affectations')).length).toBeGreaterThan(avant)
   await expect.poll(() => espace.lire('affectations/_schema.yaml')).toContain('Option B')
-  await expect(page.getByRole('button', { name: 'Scénario' })).toContainText('Plan réel + Option B')
+  await expect(page.getByRole('button', { name: 'Scénario', exact: true })).toContainText('Plan réel + Option B')
 })
 
 test('remplir d’après les besoins : ce qui manque, rôle par rôle, dans la fenêtre de chaque besoin', async ({ page }) => {
