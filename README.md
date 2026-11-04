@@ -1,0 +1,110 @@
+<img src="public/logo.svg" alt="" width="72">
+
+# mdbase
+
+**Des bases de données comme dans Notion, rangées dans un dossier de fichiers Markdown que tu gardes.**
+
+Tableaux, kanban, calendrier, timeline, relations entre bases, rollups, formules, dashboards : l'ergonomie des bases Notion, sans compte ni serveur. Chaque ligne est un fichier `.md` lisible, chaque réglage un petit fichier YAML. Le dossier se synchronise avec ce que tu utilises déjà (OneDrive, Dropbox, iCloud, git).
+
+**[Essayer dans le navigateur](https://alexisraitano-myffu.github.io/mdbase/)** : clique sur « Essayer avec la démo », rien à installer ni à choisir (Chrome ou Edge). La démo vit dans le stockage du navigateur ; « Ouvrir un dossier » sert à tes vraies données, un dossier de ton disque.
+
+![Tableau d'une base](docs/captures/tableau.png)
+
+> *English summary.* Notion-like relational databases whose only storage is a folder of Markdown + YAML files. A static web app (Chrome / Edge, File System Access API): no account, no server, nothing leaves your machine. The interface is in French for now. MIT licensed.
+
+## Ce que ça fait
+
+- **Bases et colonnes** : texte, nombre, date, case à cocher, choix simple ou multiple, lien, relation, rollup, formule, dates de création et de modification (tenues à jour par l'app). Création, renommage, réordonnancement et suppression depuis l'interface ; une base supprimée ne casse rien, les relations vers elle deviennent du texte.
+- **Relations** entre bases, toujours bidirectionnelles, et **rollups** (somme, moyenne, comptes, pourcentages, dates…), y compris des rollups de rollups.
+- **Formules** avec autocomplétion, erreurs en français et aperçu du résultat. Un interpréteur maison, qui n'exécute jamais de code venu des données.
+- **Vues** enregistrées : tableau (groupement, calculs en pied de colonne), kanban, collection, calendrier, timeline avec jalons, qui peut se déplier le long des relations (un projet, ses versions, leurs jalons) ou poser un niveau sur la ligne de son parent (un lot et ses phases à la suite, comme un Gantt), avec des bandes de périodes en travers (moratoires, sprints) un zoom libre (Ctrl + molette, pincement, + et -) et une légende des couleurs ; barres colorées selon une colonne (le statut, la priorité) ou d'une couleur fixe, dates de début et de fin de part et d'autre de la barre, une ligne d'un seul jour en losange. Filtres, tris et filtres rapides en pastilles. Chaque vue passe en **plein écran**. Tous les raccourcis clavier se retrouvent d'un clic (ou avec la touche ?).
+- **Pages** : chaque ligne s'ouvre en panneau ou en plein écran, avec ses propriétés, ses onglets de relations et un contenu en Markdown. L'éditeur met en forme au clavier ou d'un clic droit sur un mot (gras, italique, barré, code, surlignage en couleur), crée un lien sur la sélection avec `Ctrl+K`, replie les titres, et garde la mise en forme d'un texte collé depuis une page web, Word ou une réponse d'IA.
+- **Dashboards** qui rassemblent des vues de plusieurs bases, en rangées de un à trois blocs à glisser où l'on veut, avec des filtres qui valent pour tous leurs blocs (un projet choisi filtre aussi ses tâches, par les relations), et une **recherche globale** (`Ctrl+K` ou `⌘K`).
+- **Analyse** dans les dashboards : chiffres clés, graphiques et tableaux calculés en SQL sur tes bases (DuckDB, dans l'app, sans réseau), avec paramètres, formats et mise en forme conditionnelle ; chaque bloc ou le dashboard entier s'exporte en image. Des **fiches** montrent une ligne choisie par des boutons : en-tête et état, comptes à rebours, étapes, liste à pastilles, répartition et frise, colorés par des états déclarés dans le dashboard.
+- **Mode consultation** (`Ctrl+E` ou `⌘E`, ou l'icône en haut à droite) : tout passe en lecture seule, il ne reste que tes données, les onglets de vues et les filtres rapides.
+- **Import et export** : une vue en tableau Markdown, en CSV ou en image PNG (la timeline entière, par exemple) ; un CSV en nouvelle base ou en lignes ajoutées.
+- **Tableau comme dans un tableur** : sélection de lignes pour agir en lot (modifier, dupliquer, supprimer), plage de cellules tracée à la souris, copier-coller avec Excel ou du Markdown (en remplaçant ou en lignes nouvelles), poignée pour recopier une valeur, et annuler / rétablir (`Ctrl+Z`, `Ctrl+Maj+Z`).
+- **Assistant IA** (`Ctrl+J` ou `⌘J`), désactivé par défaut, dans un panneau à droite de ta base. Tu lui demandes en français, il propose, tu confirmes :
+  - **les données** : modifier ou créer des lignes (« passe les tâches en retard en priorité haute »), écrire le contenu d'une page ;
+  - **la structure** : créer une base, ajouter, renommer ou supprimer des colonnes (relations, rollups et formules compris), créer ou régler des vues avec leurs filtres, tris et groupements (et pour une timeline : jalons, couleurs, niveaux dépliés par relation, bandes de périodes), créer et réorganiser des dashboards (rangées, largeurs, vues propres). Une colonne qu'il crée peut être remplie dans la même demande ;
+  - **les suppressions** (lignes, colonnes, vues, dashboards, bases) : seulement si tu les demandes, en rouge dans l'aperçu avec ce qu'elles touchent.
+
+  Rien n'est écrit avant « Appliquer », et un plan appliqué s'annule d'un `Ctrl+Z` (sauf ce qui a été supprimé dans la structure). C'est une conversation : il pose une question quand c'est ambigu, retient tes préférences et peut enregistrer des procédures nommées (skills) dans le dossier. La réponse s'affiche au fil de l'eau ; une longue demande continue même panneau fermé, et « Arrêter » la coupe. Tape `@` pour lui citer une base, `/` pour lancer un skill ; ses réponses sont mises en forme, et tes conversations restent dans un historique. Il se branche sur n'importe quel service compatible OpenAI, distant ou local (Ollama, LM Studio) : tu fournis l'adresse, ta clé et le modèle ; la clé reste dans ton navigateur.
+- **Inbox** : un panneau où tout se dépose, une remarque, un mail collé, une présentation PowerPoint, un Word ou un PDF lâchés dessus (convertis dans l'app, tableaux et graphiques compris). Tu traites toi-même ou tu envoies à l'assistant, un élément ou toute la liste : il rattache l'information aux bonnes lignes, note des remarques datées dans les pages, propose les mises à jour et te signale les incohérences, sans rien appliquer sans toi. Ce qui est traité reste dans un historique.
+- **Documents et contexte de l'assistant** : les présentations et comptes rendus rangés depuis l'inbox, où l'assistant cherche et qu'il cite, avec une recherche et une fiche par document ; et un texte qui lui explique ton organisation une fois pour toutes, envoyé à chaque demande.
+- **Modules** : Jira, l'assistant, l'inbox, le contexte et, dans l'app de bureau, Claude s'activent un par un (en bas de la barre latérale). Ce qui ne te sert pas reste caché.
+- **Jira** (Jira Cloud), en lecture seule : une base de tickets resynchronisée toutes les 5 minutes, avec ce qui a bougé depuis la dernière fois. Les tickets se lient aux autres bases par une relation ; rien n'est jamais écrit dans Jira. Dans l'app de bureau, la connexion se règle dans l'app (e-mail et token d'API, gardés par le gestionnaire d'identifiants de Windows) et la synchro tourne tant qu'elle est ouverte. Dans le navigateur, c'est un petit script lancé sur ton poste ([`mdbase-jira.mjs`](https://alexisraitano-myffu.github.io/mdbase/mdbase-jira.mjs), Node.js) qui remplit la base.
+- **Claude Desktop et Claude Code** (serveur MCP) : Claude lit tes bases, cherche, crée et modifie des lignes, des colonnes, des options, des vues, avec les mêmes contrôles que dans l'app. Il te demande ton accord avant chaque modification. Deux façons de le brancher :
+  - **avec l'app de bureau** : active le module « Claude (MCP) », puis « Connecter à Claude Desktop » (un clic, puis redémarrer Claude Desktop) ou copie la commande affichée pour Claude Code. Rien d'autre à installer ; Claude travaille sur l'espace ouvert, ses modifications s'affichent aussitôt, et il ouvre l'app si elle est fermée ;
+  - **sans l'app de bureau** (Mac aujourd'hui) : [`mdbase.mcpb`](https://alexisraitano-myffu.github.io/mdbase/mdbase.mcpb) s'installe dans Claude Desktop d'un double-clic, et tu choisis le dossier de ton espace.
+- **App de bureau Windows** : [installeur](https://github.com/alexisraitano-myffu/mdbase/releases/latest/download/mdbase-windows-installeur.exe) (pour ton seul compte, sans droits administrateur) ou [version portable](https://github.com/alexisraitano-myffu/mdbase/releases/latest/download/mdbase-windows-portable.exe) (rien à installer). Le dossier se rouvre au lancement, et l'app voit aussitôt ce que changent la synchro Jira, Claude ou un autre poste. Jira et Claude s'y branchent depuis l'interface, sans script ni Node. Pas encore signée : au premier lancement, SmartScreen demande « Informations complémentaires » puis « Exécuter quand même ».
+- **Pensé pour la synchro** : relecture du dossier au retour sur l'onglet, écriture sûre quand un fichier a changé ailleurs, détection des copies de conflit OneDrive et des identifiants en double.
+
+![Timeline groupée par projet](docs/captures/timeline.png)
+
+## Les fichiers
+
+L'app crée et maintient tout. Rien n'est enfermé : le dossier se lit et se modifie aussi à la main.
+
+```
+MonEspace/
+  _espace.yaml            barre latérale (groupes, ordre)
+  _dashboards/pilotage.yaml
+  projets/
+    _schema.yaml          colonnes de la base
+    _vues/planning.yaml   une vue par fichier
+    _pages/defaut.yaml    mises en page
+    site-vitrine--psite001.md
+```
+
+Une ligne :
+
+```markdown
+---
+id: psite001
+titre: Site vitrine
+statut: En cours
+client: cacme001
+echeance: 2026-10-15
+budget: 8000
+---
+## Objectif
+
+Refaire le site vitrine avant le salon d'octobre.
+```
+
+Les valeurs calculées (relations inverses, rollups, formules) ne sont jamais écrites dans les fichiers : elles sont recalculées à l'ouverture. Un changement touche le moins de fichiers possible, pour limiter les conflits de synchro. Le format complet est décrit dans [docs/SPEC.md](docs/SPEC.md) (§3).
+
+## Navigateurs
+
+Chrome et Edge sur ordinateur : ce sont les seuls navigateurs qui donnent à une page web l'accès à un dossier local (File System Access API). Firefox et Safari affichent un message d'incompatibilité. Pour l'avoir comme une application (sa fenêtre, son icône dans la barre des tâches, ouverture hors ligne), clique sur l'icône « Installer » au bout de la barre d'adresse. L'app est 100 % statique : aucune télémétrie, et aucun appel réseau tant que l'assistant IA n'est pas activé (il n'appelle alors que le service que tu as choisi).
+
+## Développer
+
+```bash
+npm install
+npm run dev          # puis ouvrir http://localhost:5173 dans Chrome ou Edge
+npm test             # tests du cœur (Vitest, dans Node)
+npm run test:e2e     # tests de bout en bout (Playwright, Chrome sans fenêtre)
+npm run typecheck
+npm run build        # build statique dans dist/
+```
+
+Pour tester sur de vraies données sans risque, ouvre une copie de la démo : `cp -r exemples/espace-demo ~/essai`.
+
+- `src/core/` : le cœur en TypeScript pur, sans React ni DOM (schéma, lecture tolérante, écriture préservant le formatage, relations, rollups, formules, filtres, recherche). Il tourne tel quel dans Node pour les tests.
+- `src/adapters/` : l'accès aux fichiers (File System Access) et les services du navigateur.
+- `src/ui/` : l'interface React.
+- `docs/SPEC.md` : la spécification qui fait foi. `CLAUDE.md` : les conventions du projet.
+
+Chaque push sur `main` passe le typage, les tests et les tests de bout en bout sur le build, puis publie l'app sur GitHub Pages.
+
+Pour contribuer, en particulier pour brancher un outil tiers (autre hôte pour le dossier, fournisseur d'IA, format d'échange, service externe) : [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## État
+
+La V1 décrite dans la spec est complète et la structure du produit est stable. Le nom est provisoire. La suite porte surtout sur les intégrations d'outils tiers.
+
+## Licence
+
+[MIT](LICENSE)

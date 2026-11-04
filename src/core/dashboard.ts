@@ -1,0 +1,548 @@
+import { Document, isMap, isScalar, isSeq, parse, parseDocument, type YAMLMap, type YAMLSeq } from 'yaml'
+import { lireBlocAnalyse, lireCouleurs, lireEtats, lireParametres, lireRequetes, objetBlocAnalyse, objetParametre, type BlocAnalyse, type EntreeEtat, type Parametre } from './bi/analyse'
+import { estObjet } from './schema'
+import { OPTIONS_SORTIE_CONFIG } from './schema-ecriture'
+import { appliquerModificationsVue, lireVueDepuis, OPERATEURS, type Filtre, type ModificationVue, type Operateur, type Vue } from './vue'
+
+// Dashboards `_dashboards/<id>.yaml` (spec §10) : des rangées empilées d'un à
+// trois blocs. Un bloc montre une vue d'une base : une référence à une vue de
+// la base, ou une vue propre, écrite dans le fichier au format des `_vues/`.
+// Un bloc d'analyse (spec §10 « Analyse ») montre le résultat d'une requête SQL.
+
+/** `largeur` : part de la rangée en pourcentage ; absente, une part égale de ce qui reste. */
+export type BlocReference = { base: string; vue: string; largeur?: number }
+export type BlocPropre = { base: string; vue: Vue; largeur?: number }
+export type BlocVue = BlocReference | BlocPropre
+export type Bloc = BlocVue | BlocAnalyse
+/** `hauteur` : hauteur des blocs de la rangée en pixels ; absente, la hauteur par défaut. */
+export type Rangee = { blocs: Bloc[]; hauteur?: number }
+
+/** Hauteur des blocs d'une rangée : par défaut, et bornes d'une hauteur réglée. */
+export const HAUTEUR_BLOC = { defaut: 380, min: 160, max: 2400 } as const
+/** Filtre global (spec §10) : sur une base ; les blocs des autres bases suivent leurs relations vers elle. */
+export type FiltreGlobal = Filtre & { base: string }
+/**
+ * Filtre rapide global : une colonne d'une base, réglée comme une pastille de
+ * vue ; sans colonne, `valeur` est la liste des lignes choisies de la base.
+ */
+export type PastilleGlobale = { base: string; colonne?: string; operateur?: Operateur; valeur?: unknown }
+export type Dashboard = {
+  id: string
+  nom: string
+  rangees: Rangee[]
+  filtres: FiltreGlobal[]
+  filtresRapides: PastilleGlobale[]
+  /** Requêtes SQL nommées (spec §10 « Analyse »), dans l'ordre du fichier. */
+  requetes: Record<string, string>
+  parametres: Parametre[]
+  /** Tables valeur → couleur nommées (spec §10 « Fiches »). */
+  couleurs: Record<string, Record<string, string>>
+  /** États nommés : listes ordonnées de conditions SQL et de couleurs. */
+  etats: Record<string, EntreeEtat[]>
+}
+
+/** Trois blocs côte à côte au plus (spec §10). */
+export const BLOCS_PAR_RANGEE = 3
+/** Bornes d'une largeur de bloc, en pourcentage de la rangée. */
+export const LARGEUR_BLOC = { min: 10, max: 90 } as const
+
+export const estAnalyse = (b: Bloc): b is BlocAnalyse => !('base' in b)
+export const estPropre = (b: Bloc): b is BlocPropre => 'base' in b && typeof b.vue !== 'string'
+
+/** Place d'un bloc : sa rangée et sa position dans la rangée. */
+export type PlaceBloc = { rangee: number; bloc: number }
+/**
+ * Où déposer un bloc, comptée sur la mise en page d'avant le déplacement :
+ * dans une rangée (`position` : avant le bloc de ce rang, ou en fin), ou dans
+ * une nouvelle rangée insérée à ce rang.
+ */
+export type DestinationBloc = { rangee: number; position: number } | { nouvelleRangee: number }
+
+export type OperationDashboard =
+  | { type: 'renommer'; nom: string }
+  /** `rangee: null` : nouvelle rangée en bas ; sinon dans la rangée donnée, à `position` (en fin par défaut). */
+  | { type: 'ajouter_bloc'; rangee: number | null; position?: number; bloc: Bloc }
+  | { type: 'deplacer_bloc'; de: PlaceBloc; vers: DestinationBloc }
+  /** Remplace un bloc à sa place (vue copiée en vue propre, vue propre enregistrée dans la base) ; sa largeur reste. */
+  | { type: 'remplacer_bloc'; place: PlaceBloc; bloc: Bloc }
+  /** Largeur de chaque bloc de la rangée, dans l'ordre ; `null` : part égale. */
+  | { type: 'largeurs_rangee'; rangee: number; largeurs: (number | null)[] }
+  /** Retire le bloc ; une rangée vidée disparaît. */
+  | { type: 'retirer_bloc'; place: PlaceBloc }
+  /** Monte ou descend une rangée entière. */
+  | { type: 'deplacer_rangee'; de: number; vers: number }
+  /** Hauteur des blocs d'une rangée ; `null` revient à la hauteur par défaut. */
+  | { type: 'hauteur_rangee'; rangee: number; hauteur: number | null }
+  /** Modifie la vue propre d'un bloc (une référence se modifie dans le fichier de sa vue). */
+  | { type: 'modifier_vue'; place: PlaceBloc; modifs: ModificationVue }
+  | { type: 'filtres'; filtres: FiltreGlobal[] }
+  | { type: 'filtres_rapides'; pastilles: PastilleGlobale[] }
+  /** Réglages d'un bloc d'analyse ; une clé à `null` est retirée. */
+  | { type: 'modifier_analyse'; place: PlaceBloc; modifs: ModificationAnalyse }
+  /** Ajoute, remplace (`sql`) ou retire (`null`) une requête nommée. */
+  | { type: 'requete'; nom: string; sql: string | null }
+  | { type: 'parametres'; parametres: Parametre[] }
+  /** Valeur choisie d'un paramètre ; `null` revient au défaut. */
+  | { type: 'valeur_parametre'; nom: string; valeur: unknown }
+  /** Ajoute, remplace ou retire (`null`) une table de couleurs. */
+  | { type: 'couleurs'; nom: string; table: Record<string, string> | null }
+  /** Ajoute, remplace ou retire (`null`) un état. */
+  | { type: 'etat'; nom: string; entrees: EntreeEtat[] | null }
+
+export type ModificationAnalyse = { [K in Exclude<keyof BlocAnalyse, 'largeur'>]?: BlocAnalyse[K] | null }
+
+export class ErreurDashboard extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ErreurDashboard'
+  }
+}
+
+export function lireDashboard(texte: string, id: string): { dashboard: Dashboard | null; avertissements: string[] } {
+  let brut: unknown
+  try {
+    brut = parse(texte)
+  } catch (e) {
+    return { dashboard: null, avertissements: [`Dashboard ${id} illisible : ${(e as Error).message}`] }
+  }
+  if (!estObjet(brut)) return { dashboard: null, avertissements: [`Dashboard ${id} vide ou mal formé`] }
+  const avertissements: string[] = []
+  const rangees = (Array.isArray(brut.rangees) ? brut.rangees : []).flatMap((r, i): Rangee[] => {
+    const blocs = (estObjet(r) && Array.isArray(r.blocs) ? r.blocs : []).flatMap((b, j): Bloc[] => {
+      const ou = `rangée ${i + 1}, bloc ${j + 1}`
+      if (estObjet(b) && b.base === undefined && b.type !== undefined) {
+        const bloc = lireBlocAnalyse(b, `Dashboard ${id}, ${ou}`, avertissements)
+        const largeur = largeurBornee(b.largeur)
+        return bloc ? [{ ...bloc, ...(largeur && { largeur }) }] : []
+      }
+      if (!estObjet(b) || typeof b.base !== 'string') {
+        avertissements.push(`Dashboard ${id}, ${ou} ignoré : base manquante`)
+        return []
+      }
+      const largeur = largeurBornee(b.largeur)
+      if (typeof b.vue === 'string') return [{ base: b.base, vue: b.vue, ...(largeur && { largeur }) }]
+      const idVue = estObjet(b.vue) && typeof b.vue.id === 'string' ? b.vue.id : `bloc-${i + 1}-${j + 1}`
+      const lue = lireVueDepuis(b.vue, idVue)
+      avertissements.push(...lue.avertissements.map((a) => `Dashboard ${id}, ${ou} : ${a}`))
+      if (!lue.vue) return []
+      return [{ base: b.base, vue: lue.vue, ...(largeur && { largeur }) }]
+    })
+    if (blocs.length > BLOCS_PAR_RANGEE) avertissements.push(`Dashboard ${id}, rangée ${i + 1} : plus de ${BLOCS_PAR_RANGEE} blocs, les suivants passent à la ligne`)
+    const hauteur = estObjet(r) ? hauteurBornee(r.hauteur) : undefined
+    // Au-delà de trois blocs, on coupe en rangées plutôt que de perdre un bloc.
+    const coupees: Rangee[] = []
+    for (let k = 0; k < blocs.length; k += BLOCS_PAR_RANGEE) coupees.push({ blocs: blocs.slice(k, k + BLOCS_PAR_RANGEE), ...(hauteur && { hauteur }) })
+    return coupees
+  })
+  const filtres = (Array.isArray(brut.filtres) ? brut.filtres : []).flatMap((f): FiltreGlobal[] => {
+    if (estObjet(f) && typeof f.base === 'string' && typeof f.colonne === 'string' && (OPERATEURS as readonly string[]).includes(String(f.operateur))) {
+      return [{ base: f.base, colonne: f.colonne, operateur: f.operateur as Operateur, ...(f.valeur !== undefined && { valeur: f.valeur }) }]
+    }
+    avertissements.push(`Dashboard ${id} : filtre global ignoré (base, colonne ou opérateur manquant)`)
+    return []
+  })
+  const filtresRapides = (Array.isArray(brut.filtres_rapides) ? brut.filtres_rapides : []).flatMap((p): PastilleGlobale[] => {
+    if (!estObjet(p) || typeof p.base !== 'string') {
+      avertissements.push(`Dashboard ${id} : filtre rapide global ignoré (base manquante)`)
+      return []
+    }
+    const operateur = (OPERATEURS as readonly string[]).includes(String(p.operateur)) ? (p.operateur as Operateur) : undefined
+    return [{ base: p.base, ...(typeof p.colonne === 'string' && { colonne: p.colonne }), ...(operateur && { operateur }), ...(p.valeur !== undefined && { valeur: p.valeur }) }]
+  })
+  const requetes = lireRequetes(brut.requetes, id, avertissements)
+  const parametres = lireParametres(brut.parametres, id, avertissements)
+  const couleurs = lireCouleurs(brut.couleurs, id, avertissements)
+  const etats = lireEtats(brut.etats, id, avertissements)
+  return { dashboard: { id, nom: typeof brut.nom === 'string' ? brut.nom : id, rangees, filtres, filtresRapides, requetes, parametres, couleurs, etats }, avertissements }
+}
+
+/** Hauteur lue ou demandée, ramenée dans les bornes ; rien si ce n'est pas un nombre. */
+export function hauteurBornee(x: unknown): number | undefined {
+  if (typeof x !== 'number' || !Number.isFinite(x)) return undefined
+  return Math.round(Math.min(HAUTEUR_BLOC.max, Math.max(HAUTEUR_BLOC.min, x)))
+}
+
+/** Largeur lue ou demandée, ramenée dans les bornes ; rien si ce n'est pas un nombre. */
+export function largeurBornee(x: unknown): number | undefined {
+  if (typeof x !== 'number' || !Number.isFinite(x)) return undefined
+  return Math.round(Math.min(LARGEUR_BLOC.max, Math.max(LARGEUR_BLOC.min, x)))
+}
+
+/**
+ * Parts des blocs d'une rangée, à donner en `flex-grow` : la largeur réglée,
+ * sinon une part égale de ce qui reste (au moins la largeur minimale, si les
+ * autres prennent déjà toute la rangée).
+ */
+export function partsRangee(blocs: readonly Bloc[]): number[] {
+  const reglees = blocs.flatMap((b) => (b.largeur !== undefined ? [b.largeur] : []))
+  const libres = blocs.length - reglees.length
+  const reste = 100 - reglees.reduce((a, x) => a + x, 0)
+  const part = libres === 0 ? 0 : Math.max(reste / libres, LARGEUR_BLOC.min)
+  return blocs.map((b) => b.largeur ?? part)
+}
+
+/**
+ * Déplace un bloc dans des rangées tenues en tableaux (nœuds YAML ou objets en
+ * mémoire). Une rangée vidée disparaît ; un bloc qui change de rangée perd sa
+ * largeur (`sansLargeur`). Lève `ErreurDashboard` si la destination est pleine ou introuvable.
+ */
+function deplacerDans<R, B>(rangees: R[], blocsDe: (r: R) => B[], nouvelle: (b: B) => R, sansLargeur: (b: B) => B, de: PlaceBloc, vers: DestinationBloc): void {
+  const source = rangees[de.rangee]
+  const blocs = source && blocsDe(source)
+  const bloc = blocs?.[de.bloc]
+  if (!source || !blocs || bloc === undefined) throw new ErreurDashboard('Bloc introuvable')
+  if ('nouvelleRangee' in vers) {
+    const k = Math.max(0, Math.min(vers.nouvelleRangee, rangees.length))
+    blocs.splice(de.bloc, 1)
+    rangees.splice(k, 0, nouvelle(sansLargeur(bloc)))
+    if (blocs.length === 0) rangees.splice(rangees.indexOf(source), 1)
+    return
+  }
+  const cible = rangees[vers.rangee]
+  if (!cible) throw new ErreurDashboard('Rangée introuvable')
+  const blocsCible = blocsDe(cible)
+  if (cible === source) {
+    const position = Math.max(0, Math.min(vers.position, blocs.length))
+    blocs.splice(de.bloc, 1)
+    blocs.splice(position > de.bloc ? position - 1 : position, 0, bloc)
+    return
+  }
+  if (blocsCible.length >= BLOCS_PAR_RANGEE) throw new ErreurDashboard(`Une rangée tient ${BLOCS_PAR_RANGEE} blocs au plus`)
+  blocsCible.splice(Math.max(0, Math.min(vers.position, blocsCible.length)), 0, sansLargeur(bloc))
+  blocs.splice(de.bloc, 1)
+  if (blocs.length === 0) rangees.splice(rangees.indexOf(source), 1)
+}
+
+export function nouveauDashboard(id: string, nom: string): string {
+  return new Document({ id, nom, rangees: [] }).toString(OPTIONS_SORTIE_CONFIG)
+}
+
+/** Fichier d'une copie de dashboard : même contenu, autre identifiant et autre nom. */
+export function copierDashboard(texte: string, id: string, nom: string): string {
+  const doc = parseDocument(texte)
+  if (doc.errors.length > 0 || !isMap(doc.contents)) throw new ErreurDashboard('Dashboard illisible : copie refusée')
+  doc.set('id', id)
+  doc.set('nom', nom)
+  return doc.toString(OPTIONS_SORTIE_CONFIG)
+}
+
+/** Applique l'opération au fichier (relu sur le disque), en ne touchant qu'à la partie concernée. */
+export function modifierDashboard(texte: string, op: OperationDashboard): string {
+  const doc = parseDocument(texte)
+  if (doc.errors.length > 0 || !isMap(doc.contents)) throw new ErreurDashboard('Dashboard illisible : modification refusée')
+  const rangees = liste(doc, doc.contents, 'rangees')
+
+  switch (op.type) {
+    case 'renommer':
+      doc.set('nom', op.nom)
+      break
+    case 'ajouter_bloc': {
+      const noeud = noeudBloc(doc, op.bloc)
+      if (op.rangee === null) {
+        rangees.items.push(doc.createNode({ blocs: [noeud] }))
+        break
+      }
+      const blocs = liste(doc, rangee(rangees, op.rangee), 'blocs')
+      if (blocs.items.length >= BLOCS_PAR_RANGEE) throw new ErreurDashboard(`Une rangée tient ${BLOCS_PAR_RANGEE} blocs au plus`)
+      blocs.items.splice(Math.max(0, Math.min(op.position ?? blocs.items.length, blocs.items.length)), 0, noeud)
+      break
+    }
+    case 'deplacer_bloc':
+      deplacerDans(
+        rangees.items as unknown[],
+        (r) => (isMap(r) ? liste(doc, r, 'blocs').items : []) as unknown[],
+        (b) => doc.createNode({ blocs: [b] }),
+        (b) => {
+          if (isMap(b)) b.delete('largeur')
+          return b
+        },
+        op.de,
+        op.vers,
+      )
+      break
+    case 'remplacer_bloc': {
+      const blocs = liste(doc, rangee(rangees, op.place.rangee), 'blocs')
+      const ancien = blocs.items[op.place.bloc]
+      if (!ancien) throw new ErreurDashboard('Bloc introuvable')
+      const largeur = isMap(ancien) ? largeurBornee(ancien.get('largeur')) : undefined
+      blocs.items[op.place.bloc] = noeudBloc(doc, { ...op.bloc, ...(largeur && { largeur }) })
+      break
+    }
+    case 'largeurs_rangee': {
+      const blocs = liste(doc, rangee(rangees, op.rangee), 'blocs')
+      blocs.items.forEach((b, i) => {
+        if (!isMap(b)) return
+        const largeur = largeurBornee(op.largeurs[i])
+        if (largeur === undefined) b.delete('largeur')
+        else b.set('largeur', largeur)
+      })
+      break
+    }
+    case 'retirer_bloc': {
+      const blocs = liste(doc, rangee(rangees, op.place.rangee), 'blocs')
+      if (!blocs.items[op.place.bloc]) throw new ErreurDashboard('Bloc introuvable')
+      blocs.items.splice(op.place.bloc, 1)
+      if (blocs.items.length === 0) rangees.items.splice(op.place.rangee, 1)
+      break
+    }
+    case 'deplacer_rangee': {
+      const [r] = rangees.items.splice(op.de, 1)
+      if (!r) throw new ErreurDashboard('Rangée introuvable')
+      rangees.items.splice(Math.max(0, Math.min(op.vers, rangees.items.length)), 0, r)
+      break
+    }
+    case 'hauteur_rangee': {
+      const r = rangee(rangees, op.rangee)
+      const hauteur = hauteurBornee(op.hauteur)
+      if (hauteur === undefined) r.delete('hauteur')
+      else r.set('hauteur', hauteur)
+      break
+    }
+    case 'modifier_vue': {
+      const b = liste(doc, rangee(rangees, op.place.rangee), 'blocs').items[op.place.bloc]
+      const vue = isMap(b) ? b.get('vue') : undefined
+      if (!isMap(vue)) throw new ErreurDashboard('Ce bloc montre une vue de la base : elle se modifie dans son propre fichier')
+      appliquerModificationsVue(doc, vue, op.modifs)
+      break
+    }
+    case 'filtres':
+      ecrireListe(doc, 'filtres', op.filtres.map((f) => ({ base: f.base, colonne: f.colonne, operateur: f.operateur, ...(f.valeur !== undefined && { valeur: f.valeur }) })))
+      break
+    case 'filtres_rapides':
+      ecrireListe(
+        doc,
+        'filtres_rapides',
+        op.pastilles.map((p) => ({
+          base: p.base,
+          ...(p.colonne !== undefined && { colonne: p.colonne }),
+          ...(p.operateur && { operateur: p.operateur }),
+          ...(p.valeur !== undefined && { valeur: p.valeur }),
+        })),
+      )
+      break
+    case 'modifier_analyse': {
+      const b = liste(doc, rangee(rangees, op.place.rangee), 'blocs').items[op.place.bloc]
+      if (!isMap(b) || b.has('base')) throw new ErreurDashboard('Ce bloc n’est pas un bloc d’analyse')
+      b.flow = false
+      for (const [cle, v] of Object.entries(op.modifs)) {
+        if (v === null || v === undefined) b.delete(cle)
+        else b.set(cle, enLigne(doc.createNode(cle === 'y' && Array.isArray(v) && v.length === 1 ? v[0] : v)))
+      }
+      break
+    }
+    case 'requete': {
+      const n = doc.get('requetes')
+      const requetes = isMap(n) ? n : (doc.createNode({}) as YAMLMap)
+      if (op.sql === null) requetes.delete(op.nom)
+      else requetes.set(op.nom, op.sql)
+      if (requetes.items.length === 0) doc.delete('requetes')
+      else doc.set('requetes', requetes)
+      break
+    }
+    case 'parametres':
+      ecrireListe(doc, 'parametres', op.parametres.map(objetParametre))
+      break
+    case 'couleurs':
+    case 'etat': {
+      const cle = op.type === 'couleurs' ? 'couleurs' : 'etats'
+      const n = doc.get(cle)
+      const tables = isMap(n) ? n : (doc.createNode({}) as YAMLMap)
+      const contenu = op.type === 'couleurs' ? op.table : op.entrees
+      if (contenu === null) tables.delete(op.nom)
+      else tables.set(op.nom, enLigne(doc.createNode(contenu)))
+      if (tables.items.length === 0) doc.delete(cle)
+      else if (!isMap(n)) poserEnTete(doc, cle, tables)
+      break
+    }
+    case 'valeur_parametre': {
+      const n = doc.get('parametres')
+      const p = isSeq(n) ? n.items.find((x) => isMap(x) && x.get('nom') === op.nom) : undefined
+      if (!isMap(p)) throw new ErreurDashboard(`Paramètre « ${op.nom} » introuvable`)
+      if (op.valeur === null || op.valeur === undefined) p.delete('valeur')
+      else p.set('valeur', doc.createNode(op.valeur))
+      break
+    }
+  }
+  return doc.toString(OPTIONS_SORTIE_CONFIG)
+}
+
+/**
+ * La même opération sur le dashboard en mémoire : l'affichage suit tout de
+ * suite, et deux modifications rapides partent de la bonne base.
+ */
+export function appliquerEnMemoire(d: Dashboard, op: OperationDashboard): Dashboard {
+  const rangees = d.rangees.map((r) => ({ ...r, blocs: [...r.blocs] }))
+  switch (op.type) {
+    case 'renommer':
+      return { ...d, nom: op.nom }
+    case 'ajouter_bloc': {
+      if (op.rangee === null) {
+        rangees.push({ blocs: [op.bloc] })
+        break
+      }
+      const blocs = rangees[op.rangee]?.blocs
+      blocs?.splice(Math.max(0, Math.min(op.position ?? blocs.length, blocs.length)), 0, op.bloc)
+      break
+    }
+    case 'deplacer_bloc':
+      deplacerDans(
+        rangees,
+        (r) => r.blocs,
+        (b) => ({ blocs: [b] }),
+        ({ largeur: _l, ...b }) => b,
+        op.de,
+        op.vers,
+      )
+      break
+    case 'remplacer_bloc': {
+      const r = rangees[op.place.rangee]
+      const ancien = r?.blocs[op.place.bloc]
+      if (r && ancien) r.blocs[op.place.bloc] = { ...op.bloc, ...(ancien.largeur !== undefined && { largeur: ancien.largeur }) }
+      break
+    }
+    case 'largeurs_rangee': {
+      const r = rangees[op.rangee]
+      if (r) {
+        r.blocs = r.blocs.map(({ largeur: _l, ...b }, i) => {
+          const largeur = largeurBornee(op.largeurs[i])
+          return largeur === undefined ? b : { ...b, largeur }
+        })
+      }
+      break
+    }
+    case 'retirer_bloc': {
+      const r = rangees[op.place.rangee]
+      r?.blocs.splice(op.place.bloc, 1)
+      if (r && r.blocs.length === 0) rangees.splice(op.place.rangee, 1)
+      break
+    }
+    case 'deplacer_rangee': {
+      const [r] = rangees.splice(op.de, 1)
+      if (r) rangees.splice(Math.max(0, Math.min(op.vers, rangees.length)), 0, r)
+      break
+    }
+    case 'hauteur_rangee': {
+      const r = rangees[op.rangee]
+      const hauteur = hauteurBornee(op.hauteur)
+      if (r) rangees[op.rangee] = hauteur === undefined ? { blocs: r.blocs } : { ...r, hauteur }
+      break
+    }
+    case 'modifier_vue': {
+      const r = rangees[op.place.rangee]
+      const b = r?.blocs[op.place.bloc]
+      if (r && b && estPropre(b)) r.blocs[op.place.bloc] = { ...b, vue: { ...b.vue, ...op.modifs } }
+      break
+    }
+    case 'filtres':
+      return { ...d, filtres: op.filtres }
+    case 'filtres_rapides':
+      return { ...d, filtresRapides: op.pastilles }
+    case 'modifier_analyse': {
+      const r = rangees[op.place.rangee]
+      const b = r?.blocs[op.place.bloc]
+      if (r && b && estAnalyse(b)) {
+        const modifie: Record<string, unknown> = { ...b }
+        for (const [cle, v] of Object.entries(op.modifs)) {
+          if (v === null || v === undefined) delete modifie[cle]
+          else modifie[cle] = v
+        }
+        r.blocs[op.place.bloc] = modifie as BlocAnalyse
+      }
+      break
+    }
+    case 'requete': {
+      const { [op.nom]: _ancienne, ...requetes } = d.requetes
+      return { ...d, requetes: op.sql === null ? requetes : d.requetes[op.nom] !== undefined ? { ...d.requetes, [op.nom]: op.sql } : { ...requetes, [op.nom]: op.sql } }
+    }
+    case 'parametres':
+      return { ...d, parametres: op.parametres }
+    case 'couleurs': {
+      const { [op.nom]: _t, ...couleurs } = d.couleurs
+      return { ...d, couleurs: op.table === null ? couleurs : { ...d.couleurs, [op.nom]: op.table } }
+    }
+    case 'etat': {
+      const { [op.nom]: _e, ...etats } = d.etats
+      return { ...d, etats: op.entrees === null ? etats : { ...d.etats, [op.nom]: op.entrees } }
+    }
+    case 'valeur_parametre':
+      return {
+        ...d,
+        parametres: d.parametres.map((p) => {
+          if (p.nom !== op.nom) return p
+          const { valeur: _v, ...reste } = p
+          return op.valeur === null || op.valeur === undefined ? reste : { ...p, valeur: op.valeur }
+        }),
+      }
+  }
+  return { ...d, rangees }
+}
+
+/** Une nouvelle clé de tête (`couleurs`, `etats`) se pose avant les paramètres, les requêtes et les rangées, comme dans la spec. */
+function poserEnTete(doc: Document, cle: string, valeur: YAMLMap) {
+  const racine = doc.contents
+  if (!isMap(racine)) return void doc.set(cle, valeur)
+  const i = racine.items.findIndex((p) => ['parametres', 'requetes', 'rangees', 'filtres', 'filtres_rapides'].includes(String(isScalar(p.key) ? p.key.value : p.key)))
+  const paire = doc.createPair(cle, valeur)
+  if (i < 0) racine.items.push(paire)
+  else racine.items.splice(i, 0, paire)
+}
+
+/** Une liste de filtres à la racine, un par ligne ; vide, la clé disparaît. */
+function ecrireListe(doc: Document, cle: string, items: object[]) {
+  if (items.length === 0) {
+    doc.delete(cle)
+    return
+  }
+  const seq = doc.createNode(items) as YAMLSeq
+  for (const item of seq.items) if (isMap(item)) item.flow = true
+  doc.set(cle, seq)
+}
+
+function noeudBloc(doc: Document, b: Bloc) {
+  const largeur = largeurBornee(b.largeur)
+  if (estAnalyse(b)) {
+    const objet = objetBlocAnalyse({ ...b, largeur })
+    if (Array.isArray(objet.y) && objet.y.length === 1) objet.y = objet.y[0]
+    const n = doc.createNode(objet) as YAMLMap
+    for (const p of n.items) enLigne(p.value)
+    // Un bloc court tient sur une ligne, comme un bloc vue.
+    n.flow = n.items.length <= 4 && Object.values(objet).every((v) => typeof v !== 'object' && !String(v).includes('\n') && String(v).length <= 60)
+    return n
+  }
+  if (!estPropre(b)) {
+    const n = doc.createNode({ base: b.base, vue: b.vue, ...(largeur && { largeur }) }) as YAMLMap
+    n.flow = true
+    return n
+  }
+  const vue = doc.createNode({ id: b.vue.id, nom: b.vue.nom, type: b.vue.type }) as YAMLMap
+  const { id: _i, nom: _n, type: _t, implicite: _x, ...reglages } = b.vue
+  appliquerModificationsVue(doc, vue, reglages)
+  return doc.createNode({ base: b.base, vue, ...(largeur && { largeur }) })
+}
+
+/** Listes de valeurs simples et règles écrites sur une ligne (`y: [ n, m ]`, `{ si: '> 5', couleur: rouge }`). */
+function enLigne<T>(n: T): T {
+  if (isSeq(n)) {
+    if (n.items.every((x) => !isMap(x) && !isSeq(x))) n.flow = true
+    for (const x of n.items) if (isMap(x)) x.flow = true
+  } else if (isMap(n) && n.items.every((p) => !isMap(p.value) && !isSeq(p.value))) n.flow = true
+  return n
+}
+
+function rangee(rangees: YAMLSeq, i: number): YAMLMap {
+  const r = rangees.items[i]
+  if (!isMap(r)) throw new ErreurDashboard('Rangée introuvable')
+  return r
+}
+
+/** Liste en bloc (une rangée, un bloc par ligne) : un `[]` vide du fichier devient une liste en bloc en grandissant. */
+function liste(doc: Document, parent: YAMLMap, cle: string): YAMLSeq {
+  const n = parent.get(cle)
+  if (isSeq(n)) {
+    n.flow = false
+    return n
+  }
+  const vide = doc.createNode([]) as YAMLSeq
+  parent.set(cle, vide)
+  return vide
+}

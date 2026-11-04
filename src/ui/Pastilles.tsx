@@ -1,0 +1,164 @@
+import { useRef, useState } from 'react'
+import { filtreDePastille, operateurParDefaut, SANS_VALEUR } from '../core/filtres'
+import { afficheValeurs, colonne as colonneDe, colonneOrigine, type Colonne, type Schema } from '../core/schema'
+import type { FiltreRapide, Operateur } from '../core/vue'
+import { colonnesFiltrables, entreesOperateurs, LIBELLES_OPERATEURS, ValeurFiltre } from './EditeurFiltres'
+import { titreDe, useEspace } from './contexte-espace'
+import { Flottant } from './flottant'
+import { ChevronDown, Plus, TriangleAlert } from 'lucide-react'
+import { Icone, ICONES } from './icones'
+import { Choix } from './Choix'
+import { useConsultation } from './mode'
+
+type Props = { schema: Schema; pastilles: FiltreRapide[]; changer: (p: FiltreRapide[]) => void }
+
+/**
+ * Filtres rapides (spec §7) : des colonnes épinglées au-dessus de la vue,
+ * réglées depuis leur pastille. Une pastille non réglée ne filtre rien.
+ */
+export function Pastilles({ schema, pastilles, changer }: Props) {
+  const ancre = useRef<HTMLButtonElement>(null)
+  const [choix, setChoix] = useState(false)
+  const lecture = useConsultation()
+  const libres = colonnesFiltrables(schema).filter((c) => !pastilles.some((p) => p.colonne === c.cle))
+  const remplacer = (i: number, p: FiltreRapide | null) =>
+    changer(p === null ? pastilles.filter((_, j) => j !== i) : pastilles.map((x, j) => (j === i ? p : x)))
+
+  return (
+    <div className="filtres-rapides">
+      {pastilles.map((p, i) => {
+        const c = colonneDe(schema, p.colonne)
+        return c ? (
+          <PastilleFiltre key={p.colonne} schema={schema} colonne={c} pastille={p} changer={(n) => remplacer(i, n)} />
+        ) : null
+      })}
+      {libres.length > 0 && !lecture && (
+        <button ref={ancre} className="discret ajout-pastille" onClick={() => setChoix(true)}>
+          <Icone de={Plus} /> Filtre rapide
+        </button>
+      )}
+      {choix && (
+        <Flottant ancre={ancre.current} fermer={() => setChoix(false)}>
+          {libres.map((c) => (
+            <button
+              key={c.cle}
+              className="option"
+              onClick={() => {
+                setChoix(false)
+                changer([...pastilles, { colonne: c.cle, operateur: operateurParDefaut(c) }])
+              }}
+            >
+              <Icone de={ICONES[c.type]} />
+              {c.nom}
+            </button>
+          ))}
+        </Flottant>
+      )}
+    </div>
+  )
+}
+
+/** Une pastille réglée depuis son menu ; `libelle` remplace le nom de la colonne (filtres globaux : « Base › Colonne »). */
+export function PastilleFiltre(p: { schema: Schema; colonne: Colonne; pastille: FiltreRapide; changer: (p: FiltreRapide | null) => void; libelle?: string }) {
+  const ancre = useRef<HTMLButtonElement>(null)
+  const [ouvert, setOuvert] = useState(false)
+  const lecture = useConsultation()
+  const { colonne, pastille } = p
+  const operateur = pastille.operateur ?? operateurParDefaut(colonne)
+  const actif = filtreDePastille(p.schema, pastille) !== null
+  const { etat } = useEspace()
+  // Relation, ou rollup qui affiche les lignes d'une relation : la valeur est un id, on montre le titre.
+  const origine = afficheValeurs(colonne) ? colonneOrigine((b) => etat.bases.get(b)?.depot?.schema, p.schema.id, colonne) : colonne
+  const relation = origine?.type === 'relation' ? origine : undefined
+  const ids = relation ? (Array.isArray(pastille.valeur) ? pastille.valeur.map(String) : typeof pastille.valeur === 'string' ? [pastille.valeur] : []) : []
+  const titres = ids.map((id) => titreDe(etat, relation!.cible, id))
+  // Une ligne liée disparue garde son id, signalé.
+  const disparue = titres.some((t) => t === undefined)
+  const valeurAffichee = relation && ids.length > 0 ? (Array.isArray(pastille.valeur) ? titres.map((t, i) => t ?? ids[i]) : (titres[0] ?? ids[0])) : pastille.valeur
+
+  return (
+    <>
+      <button ref={ancre} className={`pilule ${actif ? 'active' : ''}`} onClick={() => setOuvert(true)}>
+        {p.libelle ?? colonne.nom}
+        {actif && (
+          <span className="resume">
+            {' : '}
+            {disparue && <Icone de={TriangleAlert} className="alerte" taille={13} />}
+            {resumer(colonne, operateur, valeurAffichee)}
+          </span>
+        )}
+        <Icone de={ChevronDown} className="chevron" taille={12} />
+      </button>
+      {ouvert && (
+        <Flottant ancre={ancre.current} fermer={() => setOuvert(false)}>
+          <div className="panneau-pastille">
+            <div className="ligne-filtre">
+              <strong>{colonne.nom}</strong>
+              <Choix
+                valeur={operateur}
+                entrees={entreesOperateurs(colonne)}
+                libelle="Opérateur"
+                changer={(v) => p.changer({ colonne: colonne.cle, operateur: v as Operateur })}
+              />
+            </div>
+            <div className="valeur-filtre">
+              <ValeurFiltre
+                base={p.schema.id}
+                colonne={colonne}
+                filtre={{ colonne: colonne.cle, operateur, ...(pastille.valeur !== undefined && { valeur: pastille.valeur }) }}
+                changer={(valeur) => p.changer({ ...pastille, operateur, valeur })}
+              />
+            </div>
+            <div className="boutons">
+              {actif && (
+                <button className="discret" onClick={() => p.changer({ colonne: colonne.cle, operateur })}>
+                  Effacer
+                </button>
+              )}
+              {!lecture && (
+                <button className="discret danger-texte" onClick={() => p.changer(null)}>
+                  Retirer la pastille
+                </button>
+              )}
+            </div>
+          </div>
+        </Flottant>
+      )}
+    </>
+  )
+}
+
+function resumer(c: Colonne, operateur: Operateur, valeur: unknown): string {
+  if (SANS_VALEUR.includes(operateur)) return LIBELLES_OPERATEURS[operateur]
+  const texte = (v: unknown): string =>
+    v === 'aujourdhui'
+      ? "aujourd'hui"
+      : typeof v === 'boolean'
+        ? v ? 'coché' : 'non coché'
+        : c.type === 'date' && typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)
+          ? v.split('-').reverse().join('/')
+          : String(v)
+  if (Array.isArray(valeur)) {
+    const liste = valeur.map(texte)
+    if (operateur === 'entre') return `du ${liste[0]} au ${liste[1]}`
+    const courte = liste.length > 2 ? `${liste.slice(0, 2).join(', ')} +${liste.length - 2}` : liste.join(', ')
+    return operateur === 'pas_parmi' ? `sauf ${courte}` : courte
+  }
+  const prefixes: Partial<Record<Operateur, string>> = {
+    different_de: '≠',
+    ne_contient_pas: 'sans',
+    pas_parmi: 'sauf',
+    commence_par: 'commence par',
+    finit_par: 'finit par',
+    superieur: '>',
+    inferieur: '<',
+    superieur_egal: '≥',
+    inferieur_egal: '≤',
+    avant: 'avant',
+    apres: 'après',
+    jours_passes: 'derniers jours :',
+    jours_a_venir: 'prochains jours :',
+  }
+  const prefixe = prefixes[operateur]
+  return prefixe ? `${prefixe} ${texte(valeur)}` : texte(valeur)
+}

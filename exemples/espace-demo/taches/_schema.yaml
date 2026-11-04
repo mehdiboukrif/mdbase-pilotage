@@ -1,0 +1,21 @@
+version: 1
+id: taches
+nom: Tâches
+champ_titre: titre
+colonnes:
+  - { cle: titre, nom: Titre, type: text }
+  - { cle: projet, nom: Projet, type: relation, cible: projets, proprietaire: true, inverse: taches }
+  - cle: priorite
+    nom: Priorité
+    type: select
+    options:
+      - { label: Haute, couleur: rouge }
+      - { label: Normale, couleur: jaune }
+      - { label: Basse, couleur: gris }
+  - { cle: debut, nom: Début, type: date }
+  - { cle: echeance, nom: Échéance, type: date }
+  - { cle: heures, nom: Heures, type: number }
+  - { cle: fait, nom: Fait, type: checkbox }
+  - { cle: duree, nom: Durée (jours), type: formula, expression: 'ecart_jours(prop("debut"), prop("echeance")) + 1' }
+  - { cle: en_retard, nom: En retard, type: formula, expression: 'non prop("fait") et prop("echeance") < aujourdhui()' }
+vues: [ tableau, par-priorite, calendrier, planning ]

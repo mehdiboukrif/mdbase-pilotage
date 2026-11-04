@@ -1,0 +1,1229 @@
+# SPEC — Base de données Markdown + YAML (nom provisoire)
+
+> Document de référence pour Claude Code. Lire en entier avant toute implémentation.
+> Les décisions marquées **[DÉCIDÉ]** ne se rediscutent pas sans validation d'Alex.
+> Les éléments marqués **[PLUS TARD]** sont hors périmètre : ne pas les implémenter, mais ne pas fermer la porte.
+
+---
+
+## 1. Vision
+
+Une application de bases de données relationnelles avec l'ergonomie de Notion, dont le **seul format de stockage** est un dossier de fichiers Markdown + YAML.
+
+- L'utilisateur **ne voit et n'édite jamais les fichiers directement**. Tout passe par l'interface : bases, vues, pages. L'app crée et maintient les fichiers.
+- Les fichiers restent lisibles, portables et synchronisables (OneDrive en priorité), sans serveur ni compte.
+- Cible initiale : utilisateurs Windows frustrés par Excel et les outils existants, dossier synchronisé via OneDrive.
+- **Local-first et sécurisé par simplicité** : aucune donnée ne quitte la machine (seule exception : le module IA, désactivé par défaut, voir §12), aucun code n'est exécuté depuis les données.
+
+### Principes directeurs
+1. **UX avant tout.** Le niveau d'ergonomie visé est celui des bases Notion. Le fond peut être simple, l'usage doit être fluide.
+2. **Simplicité du périmètre.** On reproduit les 20 % de Notion qui font 80 % de la sensation. Tout le reste est coupé.
+3. **Les fichiers sont la seule source de vérité.** Tout ce qui est calculé (relations inverses, rollups, formules) est recalculé, jamais stocké.
+4. **Un changement = le moins de fichiers touchés possible**, pour limiter les conflits de synchronisation.
+
+---
+
+## 2. Périmètre V1
+
+### Inclus
+- Barre latérale : dashboards en haut, puis groupes de bases.
+- Groupes **plats** (pas de sous-groupes) contenant des bases. Une base peut aussi être hors groupe.
+- Repli des sections [DÉCIDÉ, demandé par Alex le 19/10/2026] : un clic sur le nom de « Dashboards », d'un groupe ou de « Hors groupe » le replie ; replié, il montre le nombre d'entrées cachées et garde l'entrée ouverte. Le repli est une préférence de la machine, par espace (stockage du navigateur), jamais écrite dans le dossier.
+- Création d'une base par un bouton.
+- Types de colonnes : `text`, `number`, `date`, `checkbox`, `select`, `multiselect`, `url`, `relation`, `rollup`, `formula`.
+- Relations bidirectionnelles entre bases différentes.
+- Rollups sur n'importe quel champ de la base liée, rollups de rollups.
+- Formules niveaux 1 et 2 (voir §6).
+- Filtres, tris, groupements et calculs sur **toutes** les colonnes, calculées comprises, sans exception.
+- Filtres rapides en haut de vue : des colonnes épinglées en pastilles, réglées en un clic.
+- Création de ligne par un bouton `+`, avec héritage des filtres simples.
+- Vues : tableau, kanban, collection, calendrier, timeline avec jalons.
+- Dashboards : blocs de vues empilés verticalement, possibilité de deux blocs côte à côte.
+- Page d'une ligne : ouverture en panneau à droite, option plein écran, mises en page enregistrées, onglets relation.
+- Recherche globale.
+- Sauvegarde instantanée de toute modification (données et configuration).
+
+### [PLUS TARD]
+Choix de cardinalité 1-n / n-n par l'utilisateur, champs obligatoires, modèles de lignes, images et pièces jointes, import et export, dashboards en grille libre, formules manipulant des listes, mises en page déclenchées par règle, type de colonne `personne`, collaboration temps réel, version bureau Tauri, plugin Obsidian.
+
+---
+
+## 3. Format des fichiers [DÉCIDÉ]
+
+### Arborescence
+
+```
+MonEspace/
+  _espace.yaml
+  _dashboards/
+    pilotage.yaml
+  _assistant/            (module IA, §12 ; absent tant qu'il ne sert pas)
+    memoire.md
+    skills/
+      revue-du-lundi.md
+    contexte.md          (§18)
+    documents/
+    inbox/
+  projets/
+    _schema.yaml
+    _vues/
+      tableau-principal.yaml
+      kanban-statut.yaml
+    _pages/
+      defaut.yaml
+      suivi.yaml
+    navi--k2x9m4pq.md
+    synapse--p4m1z8rt.md
+  taches/
+    _schema.yaml
+    _vues/
+    _pages/
+    ...
+```
+
+Règles :
+- **Toutes les bases sont à plat** à la racine de l'espace. Les groupes n'existent que dans `_espace.yaml`. Déplacer une base d'un groupe à un autre ne déplace aucun fichier.
+- Tout fichier ou dossier préfixé par `_` est de la configuration.
+- **Un fichier par vue, un fichier par mise en page, un fichier par dashboard**, pour que deux modifications de configuration distinctes ne touchent jamais le même fichier.
+- `_assistant/` (module IA, §12) : jamais affiché comme une base.
+  - `memoire.md` : ce que l'assistant retient, un fait par ligne de liste (`- …`) ; le reste du fichier est préservé.
+  - `skills/<slug>.md` : une procédure nommée, frontmatter `nom` et `description`, corps en Markdown = les instructions.
+  - `contexte.md`, `documents/`, `inbox/` : connaissance de l'assistant (§18).
+
+### Identifiants
+- Chaque ligne, base, vue, mise en page, dashboard et colonne possède un identifiant stable.
+- Identifiant de ligne : 8 caractères `[a-z0-9]`, aléatoire, généré à la création, **jamais modifié**.
+- Nom de fichier d'une ligne : `<slug-du-titre>--<id>.md`. Le slug est mis à jour quand le titre change (renommage du fichier), l'identifiant jamais.
+- Le renommage du fichier se fait **à la sortie du champ titre**, jamais à chaque frappe : chaque renommage est vu par la synchro comme une suppression suivie d'une création.
+- **Toute résolution passe par l'`id` du frontmatter**, jamais par le nom de fichier. Un fichier renommé à la main ou par la synchro reste valide.
+- Identifiant de base : fixé à la création, égal au nom du dossier, **jamais modifié**. Renommer une base ne change que son `nom` affiché : aucun dossier renommé, aucune référence (`cible`, `_espace.yaml`, dashboards) réécrite. Même logique que les colonnes (§3, `_schema.yaml`).
+
+### `_espace.yaml`
+
+```yaml
+version: 1
+barre_laterale:
+  dashboards: [pilotage]
+  groupes:
+    - nom: Travail
+      bases: [projets, taches, clients]
+    - nom: Perso
+      bases: [lectures]
+  hors_groupe: [inbox]
+taches:                       # optionnel : base des tâches (§ Base des tâches)
+  base: taches
+  fait: statut                # checkbox ou select
+  terminees: [Terminé]        # select seulement
+  echeance: echeance          # optionnel
+  sous_taches: sous_taches    # optionnel : auto-relation, côté qui liste les sous-tâches
+```
+
+### `_schema.yaml`
+
+```yaml
+version: 1
+id: projets
+nom: Projets
+champ_titre: titre
+colonnes:
+  - cle: titre
+    nom: Titre
+    type: text
+  - cle: statut
+    nom: Statut
+    type: select
+    options:
+      - { label: À faire, couleur: gris }
+      - { label: En cours, couleur: bleu }
+      - { label: Terminé, couleur: vert }
+  - cle: echeance
+    nom: Échéance
+    type: date
+  - cle: client
+    nom: Client
+    type: relation
+    cible: clients
+    proprietaire: true          # ce côté stocke le lien
+    inverse: projets            # clé de la colonne miroir dans la base cible
+  - cle: taches
+    nom: Tâches
+    type: relation
+    cible: taches
+    proprietaire: false         # lien stocké côté taches, calculé ici
+    inverse: projet
+  - cle: nb_taches_ouvertes
+    nom: Tâches ouvertes
+    type: rollup
+    relation: taches
+    champ: statut
+    calcul: compter_valeurs
+    filtre: { operateur: different_de, valeur: Terminé }   # optionnel
+  - cle: jours_restants
+    nom: Jours restants
+    type: formula
+    expression: "ecart_jours(aujourdhui(), prop(\"echeance\"))"
+```
+
+Règles :
+- `vues` (optionnel) : ordre des onglets de vues de la base ; les vues non citées suivent, par nom de fichier. Réordonner les onglets ne modifie que ce fichier.
+- **La `cle` d'une colonne est fixée à la création et ne change jamais.** Renommer une colonne modifie seulement `nom`. Aucune réécriture de fichiers de lignes.
+- La clé est un slug `snake_case` dérivé du nom à la création, dédoublonné si nécessaire.
+- **La clé `id` est réservée** à l'identifiant de ligne, caché et géré automatiquement. Une colonne dont le slug donnerait `id` (ex. une colonne nommée « Id ») reçoit une clé dédoublonnée (`id_2`).
+- **Colonne titre** : chaque base a toujours une colonne titre (`champ_titre`), de type `text`. L'utilisateur peut **choisir** quelle colonne `text` sert de titre, et la **déplacer** librement dans l'ordre des colonnes comme n'importe quelle autre. Changer de colonne titre renomme les fichiers de la base (nouveau slug) : action rare, explicite, faite par lot.
+
+### Fichier d'une ligne
+
+```markdown
+---
+id: k2x9m4pq
+titre: Navi
+statut: En cours
+echeance: 2026-10-15
+client: c7ab3kx1
+---
+Le corps de la page, en Markdown libre.
+```
+
+Règles d'écriture :
+- **Ne sont écrits que les champs saisis.** Jamais de rollup, de formule ni de relation non propriétaire dans un fichier.
+- Un champ vide est **omis** du frontmatter (pas de `null`, pas de chaîne vide).
+- L'ordre des clés suit l'ordre du schéma.
+
+Encodage des valeurs :
+
+| Type | Stockage |
+|---|---|
+| `text` | chaîne |
+| `number` | nombre |
+| `date` | `YYYY-MM-DD` ou `YYYY-MM-DDTHH:mm` (ISO 8601, heure locale) |
+| `checkbox` | `true` / `false` (omis si faux) |
+| `select` | label en clair (`En cours`) |
+| `multiselect` | liste de labels |
+| `url` | chaîne |
+| `relation` (propriétaire) | un id, ou une liste d'ids |
+
+- Les options de `select` sont stockées **en clair** pour la lisibilité. Renommer une option réécrit les fichiers qui l'utilisent : action rare, explicite, faite par lot.
+- **Retirer une option** [DÉCIDÉ, demandé par Alex le 09/10/2026] : depuis le menu de la colonne (« Options »), ou par l'outil `retirer_option` (assistant, MCP). Les lignes qui l'ont prennent l'option de remplacement choisie, ou perdent la valeur (dans un choix multiple, elle est retirée de la liste, sans doublon). La confirmation dit combien de lignes sont réécrites. Comme le renommage, c'est une réécriture par lot, hors annulation.
+
+### Dates de création et de modification [DÉCIDÉ, demandé par Alex le 09/10/2026]
+
+```markdown
+---
+id: k2x9m4pq
+titre: Navi
+statut: En cours
+_cree: 2026-10-09T14:32
+_modifie: 2026-10-12T09:05
+---
+```
+
+- L'app (interface, assistant, serveur MCP) écrit `_cree` à la création d'une ligne, puis `_modifie` à chaque écriture qu'elle y fait : cellule, contenu de la page, annulation. Format `AAAA-MM-JJTHH:mm`, heure locale. Les deux clés vont en fin de frontmatter.
+- Le « _ » initial les protège : aucune clé de colonne ne commence par « _ » (une base Jira a déjà sa colonne `cree`, sans conflit).
+- **Ne les mettent pas à jour** : une modification faite à la main dans le fichier ; la synchro Jira, qui a ses propres dates ; les réécritures de toute une colonne liées au schéma (colonne supprimée, option retirée ou renommée), qui marqueraient sinon toute la base comme modifiée. Une ligne dupliquée reçoit son propre `_cree`.
+- Deux types de colonnes les montrent : **`created`** (« Créé le ») et **`modified`** (« Modifié le »). Calculées, en lecture seule, de nature date : filtres (« les 7 derniers jours » pour repérer le nouveau), tris, groupements, formules et rollups comme une date. Valeur de « Créé le » : `_cree`, et vide sans lui (lignes d'avant, fichiers créés hors de l'app) ; aucun rattrapage [DÉCIDÉ, demandé par Alex le 12/10/2026]. Valeur de « Modifié le » : `_modifie`, à défaut `_cree`, à défaut la date du fichier.
+
+---
+
+## 4. Robustesse et lecture tolérante [DÉCIDÉ]
+
+L'app écrit strictement, mais **lit avec tolérance**, car un fichier peut avoir été modifié à la main ou abîmé par la synchro.
+
+- Un champ inconnu du schéma est **conservé** à la réécriture, jamais supprimé.
+- Une valeur invalide (texte dans un `number`, option inexistante) est affichée telle quelle avec un indicateur d'avertissement, jamais effacée.
+- Un fichier `.md` sans frontmatter ou sans `id` dans un dossier de base : ignoré en V1 et signalé dans une liste de fichiers non reconnus. Pas d'import automatique.
+- Un id en double (copie de fichier, conflit OneDrive) : les deux lignes sont affichées, marquées en conflit, l'utilisateur choisit.
+- Un lien de relation vers un id introuvable : affiché comme lien cassé, conservé dans le fichier.
+- Les fichiers de conflit OneDrive (`nom-PC.md`, etc.) sont détectés et signalés.
+- **Écriture sûre face aux changements externes** : avant d'écrire un fichier, l'app compare sa date de modification à celle de la dernière lecture. Si elle a changé, l'app relit le fichier, réapplique uniquement le champ que l'utilisateur vient de modifier, puis écrit. Pas d'écran de conflit en V1.
+- **La réécriture d'un fichier préserve son formatage** : utiliser l'API `Document` de la librairie `yaml` (eemeli/yaml) pour modifier le frontmatter sans toucher au reste, commentaires compris.
+
+Précisions d'implémentation (jalon 12) :
+- Id en double : les lignes restent affichées (les liens et les calculs vont vers la première lue). L'utilisateur choisit : garder une version (les autres fichiers sont supprimés, après confirmation) ou faire d'une version une ligne à part (nouvel id, nouveau nom de fichier ; la nouvelle est écrite avant que l'ancienne soit effacée).
+- Copie de conflit : un fichier `<nom>-<SUFFIXE>.<ext>` à côté de `<nom>.<ext>`, où le suffixe contient une majuscule (nom de machine ajouté par OneDrive ; les noms fabriqués par l'app n'en ont jamais). Une copie d'un fichier de configuration n'est jamais chargée ; elle est signalée, et l'utilisateur garde l'original ou la copie. Une copie d'une ligne se voit comme un id en double.
+- Suppression d'une ligne : le nettoyage des liens qui pointaient vers elle est proposé (case cochée par défaut dans la confirmation), jamais fait en silence. Si un autre fichier porte le même id, les liens restent.
+
+---
+
+## 5. Relations et rollups [DÉCIDÉ]
+
+C'est la fonctionnalité prioritaire. Elle doit être solide et parfaitement intégrée.
+
+### Relations
+- Toujours **bidirectionnelles** : créer une relation crée automatiquement la colonne miroir dans la base cible.
+- **Stockage d'un seul côté** : le côté `proprietaire: true` écrit les ids. L'autre côté est calculé à partir de l'index.
+- Choix du propriétaire à la création : **en V1, le côté où la relation a été créée.**
+  - [PLUS TARD] avec la cardinalité configurable : si une des deux colonnes est mono-valeur (1-n), le propriétaire sera le côté « n » (ex. la tâche porte son projet).
+- En V1, **toutes les relations sont multi-valeurs** côté propriétaire (liste d'ids). La cardinalité configurable est [PLUS TARD] mais le modèle doit l'absorber sans migration.
+- **Édition depuis le côté non propriétaire** : l'utilisateur ajoute ou retire un lien normalement ; l'app traduit l'action en écriture dans le fichier du propriétaire. Un lien ajouté ou retiré = **un seul fichier modifié**.
+- **Auto-relation** [DÉCIDÉ, demandé par Alex le 19/10/2026, remplace « pas d'auto-relation en V1 »] : une relation peut viser sa propre base (tâche parente / sous-tâches). Ses deux colonnes sont dans le même schéma, le stockage reste d'un seul côté. Une ligne ne se lie jamais à elle-même (elle n'est pas proposée, et l'assistant le refuse). Une boucle écrite à la main (A sous B, B sous A) n'est pas une erreur de fichier : les affichages qui descendent les liens (contenus liés, timeline en arbre, tâches) ne repassent jamais par une ligne déjà sur le chemin. Dupliquer la base duplique l'auto-relation vers la copie elle-même.
+- Supprimer une ligne : les liens qui pointaient vers elle deviennent des liens cassés (§4). Proposer un nettoyage, ne pas réécrire silencieusement.
+
+### Suppressions de colonnes et de bases [DÉCIDÉ]
+- **Supprimer une colonne saisie** supprime son contenu : la clé est retirée de tous les fichiers de la base. Exception assumée au principe « le moins de fichiers touchés », comme le renommage d'une option de `select`.
+- **Supprimer une relation** supprime seulement la relation : la colonne et sa colonne miroir disparaissent, les ids sont retirés des fichiers du côté propriétaire. Les lignes des deux bases restent intactes.
+- **Supprimer une base** vers laquelle pointaient des relations : dans chaque base qui pointait vers elle, la colonne relation est convertie en colonne `text` contenant les titres des lignes liées (séparés par des virgules). Aucune donnée perdue.
+  - Depuis le bouton ⋯ de la base dans la barre latérale (ou le clic droit), qui propose aussi de la renommer. La confirmation dit tout ce qui est touché : nombre de lignes, relations converties, colonnes calculées qui passeront en erreur, blocs de dashboard retirés. Ne s'annule pas (hors Ctrl+Z, comme le schéma).
+  - Ordre : relations converties, blocs de dashboard retirés, puis le dossier effacé en commençant par `_schema.yaml`. Une coupure laisse un dossier qui n'est plus une base, jamais une base à moitié vide.
+- **Colonnes dépendantes** (rollups, formules qui utilisent ce qu'on supprime) : la liste est affichée au moment de la confirmation, et ces colonnes passent en erreur. Pas de suppression en cascade.
+
+### Dupliquer une base [DÉCIDÉ, demandé par Alex le 01/10/2026]
+- Depuis le ⋯ de la base (ou le clic droit). Nouveau dossier `<id>-copie`, nommé « <nom> (copie) », placé juste après l'original dans son groupe.
+- Lignes, vues et mises en page copiées telles quelles (champs inconnus et corps compris). Les ids de ligne sont gardés : ils sont propres à une base, et les vues de la copie qui citent des lignes restent justes.
+- Relations : chaque relation de la copie devient **propriétaire** et reçoit sa propre colonne miroir dans la base reliée (« Projets (copie) » dans Clients). Les liens d'un côté non propriétaire, calculés dans l'original, sont écrits dans les lignes de la copie. L'original et ses liens ne changent pas.
+- Ordre : fichiers de la copie, puis son `_schema.yaml`, puis les colonnes miroirs. Une coupure avant le schéma laisse un dossier qui n'est pas encore une base.
+
+### Rollups
+- Un rollup référence une colonne `relation` de sa base et une colonne (`champ`) de la base liée.
+- **N'importe quelle colonne** de la base liée peut être remontée, y compris un rollup ou une formule.
+- Calculs disponibles :
+  - `afficher` (valeurs brutes), `afficher_uniques` (chaque valeur une fois, dans l'ordre d'apparition) [DÉCIDÉ, demandé par Alex le 01/10/2026]
+  - `compter`, `compter_valeurs`, `compter_uniques`, `compter_vides`, `compter_non_vides`
+  - `pourcent_coches`, `pourcent_non_coches`
+  - `somme`, `moyenne`, `mediane`, `min`, `max`, `amplitude`
+  - `date_plus_tot`, `date_plus_tard`
+- Filtre optionnel sur les lignes liées avant calcul (ex. ne compter que les tâches non terminées).
+- **Rollups de rollups autorisés**, sans limite de profondeur.
+- Le résultat d'un rollup a un type (nombre, date, liste…) et se comporte **exactement comme une colonne saisie** pour les filtres, tris, groupements et calculs.
+- Un rollup qui affiche des valeurs les montre **comme sa colonne d'origine**, au bout de la chaîne des rollups de rollups : les titres des lignes d'une relation (jamais leurs ids), les pastilles colorées d'un select, les dates au format court.
+- **Grouper par un rollup** qui affiche des valeurs (tableau, timeline) : une ligne apparaît dans le groupe de chacune de ses valeurs, comme pour un multiselect, avec les titres ou les couleurs de la colonne d'origine. Un rollup ne s'écrit pas : une ligne créée dans un tel groupe n'en reçoit pas la valeur, et le kanban, dont les déplacements écrivent, ne propose pas les rollups.
+
+### Graphe de dépendances et boucles
+- Toutes les colonnes calculées (relations inverses, rollups, formules) forment un graphe de dépendances.
+- Le calcul se fait en **ordre topologique**.
+- **Toute configuration qui créerait une boucle est refusée au moment de la configuration**, avec un message clair nommant les colonnes impliquées. Jamais d'erreur au calcul.
+
+---
+
+## 6. Formules
+
+Une formule est une colonne calculée comme les autres, intégrée au même graphe de dépendances que les rollups.
+
+### Niveau 1
+- Références : `prop("cle")` (l'éditeur affiche les noms, stocke les clés).
+- Arithmétique : `+ - * / %`, parenthèses.
+- Comparaisons : `== != < <= > >=`, logique `et`, `ou`, `non`.
+- `si(condition, alors, sinon)`
+- `arrondi(x, n)`, `abs(x)`, `min(a, b)`, `max(a, b)`
+- Texte : `concat(a, b, …)`, `longueur(t)`, `majuscules(t)`, `minuscules(t)`
+- `vide(x)`
+
+### Niveau 2
+- `aujourdhui()`, `maintenant()`
+- `ecart_jours(d1, d2)`, `ajouter_jours(d, n)`, `ajouter_mois(d, n)`
+- `format_date(d, "JJ/MM/AAAA")`, `annee(d)`, `mois(d)`, `jour(d)`
+
+### Règles
+- **Sécurité : aucune exécution de code.** Interdits : `eval`, `new Function`, `with`, tout accès à l'environnement JS. Un parser + interpréteur maison (ou une librairie d'expressions sandboxée) qui ne connaît que les fonctions listées.
+- **Colonnes multi-valeurs interdites en V1** : une formule ne peut pas référencer une relation, un `multiselect` ou un rollup `afficher` (ils contiennent plusieurs valeurs). L'éditeur refuse avec un message clair : « cette colonne contient plusieurs valeurs, passe par un rollup (compter, somme…) ». Les formules manipulant des listes sont [PLUS TARD].
+- Gestion du vide : toute opération arithmétique avec une valeur vide renvoie vide, pas d'erreur.
+- Erreur de syntaxe ou de type : affichée dans l'éditeur, la cellule affiche un indicateur d'erreur discret.
+- L'éditeur de formules est un point d'UX important : autocomplétion des noms de colonnes et des fonctions, erreurs compréhensibles en français, aperçu du résultat sur la ligne courante.
+- Les formules dépendant de `aujourdhui()` sont recalculées au chargement et au changement de jour.
+
+### Précisions d'implémentation (jalon 10)
+- Littéraux : nombres (`3.5`), textes entre guillemets, `vrai` / `faux`. Un texte au format date (`"2026-10-01"`) vaut une date là où une date est attendue.
+- `non` porte sur toute la comparaison qui suit : `non prop("a") == 2` se lit `non (prop("a") == 2)`.
+- Le vide : une case non cochée vaut `faux` ; un texte vide est vide. `==` / `!=` comparent aussi le vide ; une condition vide compte comme fausse ; `concat` ignore les vides ; `min` / `max` les écartent.
+- `+` ne fait que l'addition de nombres : le texte s'assemble avec `concat`, qui écrit nombres, dates et cases à la française (`1234,5`, `24/09/2026`, `oui`).
+- `si` n'évalue que la branche choisie. Division par zéro : la cellule passe en erreur.
+- `min` / `max` acceptent aussi des dates ; `arrondi(x)` arrondit à l'entier ; `format_date` comprend `AAAA`, `AA`, `MM`, `JJ`, `HH`, `mm`.
+- `maintenant()` : l'heure du dernier recalcul (toute modification de ligne, ouverture, changement de jour), pas une horloge qui tourne.
+- Le type du résultat est déduit à la lecture du schéma (jamais écrit) : il décide des filtres, tris, calculs et de l'affichage, comme pour un rollup. Une formule en erreur s'affiche en erreur et n'est pas filtrable.
+
+---
+
+## 7. Vues
+
+### Socle commun à toutes les vues
+- Filtres combinés en ET, tris multiples.
+- **Groupes OU** [DÉCIDÉ, demandé par Alex le 12/10/2026] : clé facultative `filtres_ou`, une liste de groupes de filtres. Une ligne passe si tous les `filtres` sont vrais **et** si au moins un groupe est vrai (dans un groupe, tous ses filtres). Sans `filtres_ou`, rien ne change. Posés dans le fichier, par l'assistant ou par Claude ; le panneau « Filtrer » les montre en lecture et peut les retirer. L'héritage des filtres à la création (§8) les ignore.
+- Colonnes visibles et leur ordre.
+- **Filtres rapides [DÉCIDÉ]** : barre de pastilles en haut de la vue. Chaque pastille est une **colonne épinglée** (ex. « Statut ») que l'on règle directement depuis la pastille (opérateur + valeur, ex. Statut parmi En cours, À faire). Une pastille non réglée ne filtre rien. Les pastilles réglées se combinent en ET avec les filtres de la vue, qui restent le cadre fixe (panneau « Filtrer »). La valeur réglée est **enregistrée dans la vue**, comme toute configuration.
+- Mise en page utilisée pour ouvrir les lignes (§9).
+- **Sauvegarde instantanée** de toute modification de configuration.
+- **Annuler / rétablir [DÉCIDÉ]** : Ctrl+Z (⌘Z) défait la dernière modification des données, Ctrl+Maj+Z ou Ctrl+Y la rétablit : cellules, lignes créées, supprimées (fichier réécrit à l'identique, liens retirés compris), actions en lot, collage, application d'un plan de l'assistant. Une action sur plusieurs lignes s'annule d'un coup ; les frappes dans une cellule aussi, jusqu'à une pause d'une seconde. Le schéma, les vues et les dashboards n'y sont pas. Dans un champ en cours de saisie, c'est l'annulation du champ qui joue. Historique en mémoire (100 étapes), perdu au rechargement.
+- **Mode consultation [DÉCIDÉ]** : une icône en haut à droite de la zone principale (comme Obsidian, elle montre le mode où elle mène), ou Ctrl+E (⌘E), passe tout l'espace en lecture seule. Restent : la navigation (barre latérale, recherche), les onglets de vues pour en changer, les filtres rapides déjà posés (réglables, pas retirables) et l'ouverture des pages, en lecture. Disparaît tout le reste : outils de vue, création de lignes, vues, colonnes, bases et blocs, menus, renommages, glisser-déposer, sélection, édition des cellules, du titre et du corps, assistant IA, annuler/rétablir. Le mode vaut pour tout l'espace et est gardé par le navigateur (jamais écrit dans l'espace).
+- **Plein écran** : une icône à côté de celle du mode consultation affiche la vue ou le dashboard seul, sans barre latérale ni titre, sur tout l'écran quand le navigateur l'accepte. Échap (qui quitte le plein écran du navigateur) ou la même icône en sortent. Réglage de la visite, jamais mémorisé.
+- **Barre latérale réduite** : un bouton dans la tête de la barre latérale la masque ; un bouton en haut à gauche de la zone principale, ou Ctrl+B / ⌘B (hors saisie), la redéploie. Préférence de la machine (localStorage), jamais dans le dossier.
+
+### Par type
+- **Tableau** : groupement optionnel (repliable), largeur des colonnes, retour à la ligne, calculs en pied de colonne (et par groupe).
+- **Sous-groupement** (tableau et timeline) [DÉCIDÉ, demandé par Alex le 01/10/2026] : une vue groupée peut grouper encore chaque groupe par une seconde colonne (« Puis par » dans « Options », par exemple par projet puis par version). Chaque sous-groupe se replie, a son « + » (la ligne créée prend les deux valeurs) et, dans le tableau, son pied de calculs ; le pied du groupe totalise ses sous-groupes. Dans la timeline, l'en-tête d'un sous-groupe porte aussi la barre qui couvre ses lignes. Fichier : `sous_groupe`, la clé des couloirs du kanban.
+- **Tableau, plusieurs lignes à la fois [DÉCIDÉ]** :
+  - **Sélection** : case dans la gouttière de chaque ligne (visible au survol), Maj+clic pour une plage, case d'en-tête pour toutes les lignes de la vue. Une barre d'actions apparaît : copier, dupliquer, supprimer. Échap vide la sélection, Suppr propose la suppression.
+  - **Modification en lot** : dans une sélection de plusieurs lignes, une cellule modifiée l'est sur toutes (comme Notion), sauf le titre, propre à chaque ligne.
+  - **Supprimer** : confirmation, avec la case « retirer aussi les liens vers elles » quand d'autres lignes pointent vers la sélection (§5).
+  - **Dupliquer** : nouveau fichier, nouvel id, mêmes valeurs saisies et même corps. Les liens portés par l'autre base ne sont pas recopiés (ce serait écrire dans ses fichiers).
+  - **Plage de cellules** : glisser à la souris d'une case à l'autre (ou Maj+clic) trace une plage, surlignée ; un simple clic reste l'édition de la case. Échap ou un clic ailleurs l'efface.
+  - **Copier** : une plage donne ses cases (tabulations, et tableau HTML sans en-têtes) ; sinon les lignes sélectionnées, colonnes affichées, en tableau Markdown (texte) et HTML (pour un tableur ou un traitement de texte).
+  - **Coller en remplaçant** : sur une plage, ou dans une case en édition quand le presse-papiers contient plusieurs cases, le tableau collé remplace les valeurs à partir de la case en haut à gauche, après une confirmation qui dit combien de valeurs sont écrasées. Une valeur seule collée sur une plage la remplit toute. Au-delà de la dernière ligne, des lignes nouvelles. Les en-têtes d'un tableau Markdown sont retirés ; les relations se lisent par titres ; une option inconnue est créée ; une colonne calculée ou un texte illisible est ignoré (et compté). La confirmation propose aussi de coller en lignes nouvelles.
+  - **Coller en lignes nouvelles** : sans plage ni case en édition, un tableau (Markdown, CSV, ou cases copiées d'un tableur) passe par l'aperçu de l'import. Une première ligne qui nomme des colonnes sert d'en-têtes ; sinon chaque valeur va dans la colonne affichée à la même place. Une seule valeur collée ne crée rien.
+  - **Suppr sur une plage** vide ses cases (Ctrl+Z les remet).
+  - **Repères visuels** : ce qui vient d'être copié (plage ou lignes) garde un pointillé qui défile, comme dans un tableur, jusqu'à Échap ou la prochaine action. Après un collage, une recopie, une action en lot, un Ctrl+Z ou un plan de l'assistant, les cases touchées brillent un instant. Rien ne bouge si le système demande moins d'animations.
+  - **Recopie** : la poignée au coin d'une cellule, tirée vers le haut ou le bas, donne sa valeur aux lignes survolées (le tableau défile au bord). Pas sur le titre ni sur une colonne calculée.
+- **Kanban** : champ de groupe (`select`, `checkbox`, `relation`), sous-groupe optionnel (couloirs horizontaux), champs affichés sur la carte, glisser-déposer entre colonnes qui modifie la valeur. **Ordre des colonnes** [DÉCIDÉ, demandé par Alex le 02/10/2026] : celui des options (non coché puis coché, sinon alphabétique, le groupe vide en dernier) ; glisser l'en-tête d'une colonne sur un autre l'y place, et l'ordre complet est écrit dans la vue (`ordre_groupes`, les valeurs des groupes : libellé d'option, id de ligne liée, `∅` pour le groupe vide). La section « Ordre des colonnes » des Options du kanban fait la même chose dans une liste (toutes les valeurs possibles, même sans carte), avec « Revenir à l'ordre des options » ; changer la colonne du kanban retire l'ordre réglé. Une valeur absente de la liste suit, dans l'ordre habituel ; une valeur de la liste qui n'existe plus est ignorée. Marche aussi sur une base en lecture seule (Jira), dont les vues se règlent. Sur une relation, le déplacement **remplace** le lien (pas d'ajout). Grouper sur une relation multi-valeurs n'est pas une bonne pratique : ce cas trouvera sa vraie place avec les relations 1-n [PLUS TARD].
+- **Collection** : cartes affichant les champs choisis et, en option, les premières lignes du corps.
+- **Calendrier** : champ date utilisé, champ de fin optionnel pour les plages, vue mois / semaine, champs affichés sous le titre, glisser-déposer pour changer la date (la ligne suit le pointeur et s'accroche au jour le plus proche au relâcher).
+- **Timeline** : champ de début, champ de fin, **champs jalons** (zéro ou plusieurs colonnes date affichées comme des points sur la ligne), zoom semaine / mois / trimestre, champs affichés sur la barre, groupement optionnel (repliable ; l'en-tête d'un groupe porte une barre calculée qui couvre ses lignes, non déplaçable), date exacte affichée pendant un glisser, redimensionnement et déplacement des barres à la souris (au pixel, accroché au jour au relâcher).
+- **Timeline en arbre** [DÉCIDÉ, validé par Alex le 25/09/2026] : sous chaque ligne, les lignes liées par les relations cochées dans « Options » (« Déplier par »), niveau par niveau (un projet, ses versions, leurs jalons). Plusieurs relations peuvent être cochées au même niveau.
+- **Couleur des barres** (calendrier et timeline) [DÉCIDÉ] : réglage « Couleur » dans « Options » : neutre, une couleur fixe (les couleurs nommées des options), ou « selon » une colonne select ou multiselect, la barre prenant la couleur de l'option de la ligne (la première pour un multiselect, gris pour une option sans couleur, neutre pour une cellule vide). Chaque niveau déplié a le sien. Fichier : `couleur: bleu` ou `couleur_par: statut` (la colonne l'emporte si les deux sont là). Quand la couleur suit une colonne, le réglage montre ses options, et leur couleur se change sur place [DÉCIDÉ, demandé par Alex le 27/09/2026] : c'est la couleur de l'option dans `_schema.yaml`, qui vaut partout dans l'espace (pastilles, kanban, légende).
+  - Chaque niveau a ses propres champs de début, de fin et de jalons (ceux de la base liée), et ses propres filtres. Les filtres de la vue ne portent que sur les lignes de premier niveau.
+  - Un niveau sans champ de fin s'affiche en losanges ◆ (un jalon est une date, pas une plage), qui se glissent comme une barre.
+  - Une ligne sans dates à elle porte une barre calculée qui couvre ses descendants (non déplaçable). Les lignes des niveaux inférieurs sont de vraies lignes de leur base : glisser et étirer écrivent dans leur fichier, un clic ouvre leur page.
+  - Une ligne liée à deux parents apparaît sous chacun. Une ligne déjà présente sur le chemin n'est pas redescendue (boucle de relations), et la profondeur est bornée à 5 niveaux.
+  - Auto-relation (§5) [DÉCIDÉ, demandé par Alex le 19/10/2026] : une ligne de la vue dépliée sous une autre ligne de la vue par une chaîne de relations de la base vers elle-même (sous-tâches) n'est pas répétée en tête. Une boucle sans entrée garde sa première ligne en tête ; une ligne que le dépliage ne montre plus (niveau non coché) revient en tête.
+  - Tout est déplié par défaut ; ▸ / ▾ replie une ligne, et ce choix est gardé dans le navigateur (pas dans le dossier).
+  - **Sur la ligne du parent** [DÉCIDÉ, validé par Alex le 27/09/2026] : un niveau réglé « sur la ligne » ne prend pas de rangées à lui. Ses lignes se dessinent sur la rangée de leur parent, à leurs dates (un lot et ses phases successives sur une seule ligne, comme un Gantt). Celles qui se chevauchent s'empilent dans la rangée, qui s'agrandit. La barre du parent laisse la place (ses jalons restent) ; les barres gardent leur titre à l'intérieur, coupé si elles sont trop courtes, et se glissent comme les autres. Un tel niveau ne se déplie pas plus bas. Fichier : `sur_la_ligne: true` sur le niveau.
+  - **Champs affichés par niveau** [DÉCIDÉ, demandé par Alex le 27/09/2026] : chaque niveau choisit ses champs affichés parmi les colonnes de sa base, avec les règles de la vue : le début se lit avant la barre, la fin après, les autres après le titre. Sur la ligne du parent, où les barres se touchent, les dates restent dans la barre : le début à son bord gauche, la fin à son bord droit ; une barre trop courte lâche d'abord la fin, puis le début, pour garder le titre (la plage reste dans l'infobulle). Fichier : `champs_carte` sur le niveau.
+  - **Titre masquable** [DÉCIDÉ, demandé par Alex le 27/09/2026] : dans « Champs sur la barre » de la vue et « Champs affichés » de chaque niveau, le titre est une case comme les autres, cochée par défaut. Décochée, les barres (ou losanges) de la vue ou du niveau n'écrivent plus leur titre : la légende des couleurs et l'infobulle le donnent, et les autres champs affichés restent. La colonne des titres à gauche ne change pas. Fichier : `sans_titre: true`, sur la vue ou sur le niveau.
+- **Bandes de périodes** (timeline) [DÉCIDÉ, validé par Alex le 27/09/2026] : les lignes d'une autre base (moratoires, congés, sprints…) se dessinent en bandes verticales qui traversent toute la timeline, derrière les barres, à leur couleur, avec leur titre dans l'en-tête. Un clic sur le titre ouvre la ligne. Les bandes n'élargissent pas l'étendue de la timeline. Réglage « Bandes » dans « Options » : la base, ses champs de début et de fin, sa couleur, et la place des titres. Fichier : `bandes`, une liste de sources. Titres [DÉCIDÉ, demandé par Alex le 27/09/2026] : en haut (dans l'en-tête, par défaut) ou en bas (sous la dernière rangée), `titres: bas` ; un titre plus long que sa bande n'est pas coupé, il déborde à droite, et deux titres qui se toucheraient passent sur deux rangées.
+- **Raccourcis clavier** [DÉCIDÉ, validé par Alex le 27/09/2026] : un bouton en haut à droite, à côté du plein écran, ou la touche ? (hors saisie, menu et fenêtre) ouvre la liste de tous les raccourcis, rangés par endroit. Tout nouveau raccourci s'y ajoute (`src/ui/Raccourcis.tsx`).
+- **Légende des couleurs** (timeline) [DÉCIDÉ, validé par Alex le 27/09/2026] : sous la grille, les options de chaque colonne qui colore des barres (la vue, ses niveaux dépliés, ses bandes), avec leur couleur, pour lire une barre trop courte pour son titre. Rien à régler : elle apparaît dès qu'une couleur suit une colonne, et disparaît sinon.
+- **Zoom libre** (timeline) [DÉCIDÉ, validé par Alex le 27/09/2026] : Ctrl (ou Cmd) + molette, ou le pincement du trackpad, zoome l'axe du temps sous le pointeur (la date survolée ne bouge pas) ; + et - font de même au centre, 0 revient à l'échelle choisie, comme un clic sur Semaine, Mois ou Trimestre. Les graduations suivent le zoom (jours, semaines ou mois). Le zoom est gardé dans le navigateur, par vue, et n'écrit rien dans le dossier. Jamais pendant une saisie, un menu ou une fenêtre, ni avec Ctrl (+ et - restent le zoom du navigateur).
+- Timeline : une ligne dont la plage tient en un jour s'affiche en losange (comme un niveau sans fin) ; elle se glisse, et s'étire par la droite du losange quand la vue a un champ de fin.
+- Calendrier et timeline : une ligne sans date n'apparaît pas au calendrier (compteur « sans date ») ; dans la timeline elle garde sa rangée, et un clic sur la rangée la place à cette date. Une fin absente ou antérieure au début donne une plage d'un jour. Déplacer ou étirer garde l'heure d'une date qui en a une. Les colonnes calculées (rollup de date) s'affichent mais ne se glissent pas.
+
+### Exemple `_vues/planning.yaml`
+
+```yaml
+id: planning
+nom: Planning
+type: timeline          # ou calendrier
+champ_debut: debut      # calendrier : le champ date utilisé
+champ_fin: echeance     # optionnel
+champs_jalons: [revue]  # timeline seulement
+noms_jalons: true       # timeline : le nom de la colonne à côté de chaque losange
+sans_titre: true        # timeline : barres sans leur titre (légende et infobulle le donnent)
+champs_carte: [client]  # champs affichés, comme pour le kanban ; dans la timeline, le début se lit avant la barre et la fin après
+echelle: mois           # calendrier : mois | semaine ; timeline : semaine | mois | trimestre
+deplier:                # timeline seulement : relations dépliées sous chaque ligne
+  - relation: versions  # colonne relation de cette base
+    champ_debut: debut  # colonnes de la base liée
+    champ_fin: fin
+    filtres:
+      - { colonne: statut, operateur: different_de, valeur: Abandonnée }
+    deplier:
+      - relation: jalons
+        champ_debut: date # sans champ_fin : des losanges
+      - relation: phases
+        champ_debut: debut
+        champ_fin: fin
+        sur_la_ligne: true  # les phases sur la rangée de leur version, pas en dessous
+        champs_carte: [debut, fin]  # champs affichés, pris dans la base du niveau
+        sans_titre: true            # barres du niveau sans leur titre
+bandes:                 # timeline seulement : bandes verticales tirées d'une autre base
+  - base: periodes
+    champ_debut: debut
+    champ_fin: fin      # optionnel : sans fin, une bande d'un jour
+    couleur_par: type   # ou couleur: rouge, comme pour les barres
+    titres: bas         # optionnel : titres sous la dernière rangée (en haut par défaut)
+```
+
+### Exemple `_vues/kanban-statut.yaml`
+
+```yaml
+id: kanban-statut
+nom: Par statut
+type: kanban
+groupe: statut
+sous_groupe: client
+ordre_groupes: [À faire, En cours, Terminé]   # optionnel : ordre des colonnes
+champs_carte: [echeance, nb_taches_ouvertes]
+filtres:
+  - { colonne: statut, operateur: different_de, valeur: Terminé }
+tris:
+  - { colonne: echeance, sens: asc }
+filtres_ou:                                       # optionnel : au moins un groupe vrai
+  - - { colonne: client, operateur: contient, valeur: c1 }
+  - - { colonne: urgent, operateur: egal, valeur: true }
+filtres_rapides:
+  - { colonne: client }                                          # épinglée, non réglée
+  - { colonne: jours_restants, operateur: inferieur, valeur: 0 } # réglée
+mise_en_page: suivi
+```
+
+### Opérateurs de filtre
+- Commun : `vide`, `non_vide`
+- Texte / URL : `egal`, `different_de`, `contient`, `ne_contient_pas`, `commence_par`, `finit_par`
+- Nombre : `egal`, `different_de`, `superieur`, `inferieur`, `superieur_egal`, `inferieur_egal`
+- Date : `egal`, `avant`, `apres`, `entre`, relatif (`aujourdhui`, `cette_semaine`, `ce_mois`, `jours_passes: n`, `jours_a_venir: n`). `jours_passes` et `jours_a_venir` acceptent aussi `[n, m]` : de n à m jours, bornes comprises (« il y a 8 à 30 jours ») [DÉCIDÉ, demandé par Alex le 12/10/2026]
+- Checkbox : `egal`
+- Select : `parmi`, `pas_parmi` (une liste de libellés, cochés dans une seule ligne de filtre), `egal`, `different_de`
+- Multiselect / relation : `parmi` (« contient l'un de ») et `pas_parmi` (« ne contient aucun de »), une liste de libellés ou d'ids ; `contient`, `ne_contient_pas` pour une seule valeur
+- Plusieurs valeurs [DÉCIDÉ, demandé par Alex le 12/10/2026] : un nouveau filtre ou une nouvelle pastille sur une colonne à choix ou une relation part sur `parmi`. Une cellule vide n'est « parmi » rien, et passe donc un `pas_parmi`. Une valeur seule à la place d'une liste compte comme une liste d'un élément.
+- Rollup et formule : opérateurs du type de leur résultat.
+
+---
+
+## 8. Création de ligne et héritage des filtres [DÉCIDÉ]
+
+- Bouton `+` en bas de tableau, en haut de chaque colonne kanban, dans chaque groupe, dans chaque onglet relation.
+- La ligne est créée **immédiatement** (fichier écrit), titre en édition.
+- **Héritage des filtres actifs** (filtres de vue + pastilles de filtres rapides réglées + groupe/colonne kanban où l'on a cliqué) :
+  - `egal` sur `select`, `checkbox`, `text`, `number`, `date` → la valeur est remplie ;
+  - `contient` sur `relation` → l'id est ajouté (c'est ce qui fait fonctionner les onglets relation) ;
+  - `parmi` sur `select` avec une seule valeur → remplie ;
+  - tout le reste (contient sur du texte, dates relatives, comparaisons, filtres sur rollup ou formule, groupes OU) → **ignoré, champ laissé vide**.
+- **Ligne persistante** : une ligne créée pendant la session reste visible dans la vue même si elle ne satisfait pas les filtres, avec un fond coloré et un indicateur « sortira de la vue ». Elle disparaît au prochain rafraîchissement de la vue ou changement de vue (comportement inspiré de Coda).
+
+---
+
+## 9. Pages
+
+### Ouverture
+- Clic sur une ligne → **panneau à droite**.
+- Bouton pour passer en **plein écran**.
+- Navigation clavier : `Échap` ferme, flèches haut/bas passent à la ligne précédente/suivante de la vue.
+
+### Mises en page [DÉCIDÉ]
+- Une base peut avoir **plusieurs mises en page enregistrées** (`_pages/*.yaml`), dont une par défaut.
+- Choix de la mise en page à l'ouverture :
+  1. celle définie par la vue d'où l'on ouvre la ligne ;
+  2. sinon, celle par défaut de la base ;
+  3. sélecteur en haut de la page pour basculer manuellement.
+- Une mise en page ne modifie jamais les fichiers de lignes.
+
+### Contenu d'une mise en page
+- Pour chaque champ : `visible`, `masque_si_vide`, `masque`, et l'ordre d'affichage.
+- Pour chaque relation : affichage **en champ** (pastilles) ou **en onglet** (table).
+- Position du corps : sous les propriétés, ou dans son propre onglet.
+
+### Onglets relation
+- Un onglet relation est **une vue tableau de la base liée, filtrée sur « lié à cette page »**, avec ses propres colonnes visibles.
+- Le `+` de l'onglet crée une ligne déjà liée grâce à l'héritage des filtres (§8). Aucun code spécifique.
+
+### Contenus liés [DÉCIDÉ, demandé par Alex le 01/10/2026]
+- Sous le corps de la page (là où il est : sous les propriétés ou dans son onglet), les lignes d'une relation, chacune avec son titre, quelques champs choisis, et un chevron qui déplie son corps. Un projet montre ainsi son texte, puis celui de ses tâches.
+- **Affichage seulement** : chaque texte reste dans le fichier de sa ligne. Le corps déplié s'édite sur place (même éditeur que la page) et s'écrit dans le fichier de la ligne liée ; en consultation, il se lit.
+- Un corps n'est chargé qu'au dépliage. Une ligne sans corps est marquée « vide ». Le titre ouvre la page de la ligne.
+- **Niveaux** : chaque niveau peut déplier à son tour les lignes d'une relation de sa base (client, puis projets, puis tâches), jusqu'à 5 niveaux. Une ligne déjà affichée au-dessus n'est jamais répétée (pas de boucle).
+- **Filtres et tris** par niveau, au format des vues (§7) : les tâches non faites, par échéance. Sans tri, l'ordre de la relation. Le compte dit ce que le filtre masque (« 2 sur 3 »).
+- Activé par la mise en page (réglage « Contenus liés »), donc par base et au choix : clé `contenus`, absente par défaut.
+- Auto-relation (§5) : le dépliage récursif s'en sert tel quel (une ligne déjà affichée au-dessus n'est pas répétée).
+
+### Tâches [DÉCIDÉ, demandé par Alex le 02/10/2026]
+- Une tâche est une case à cocher Markdown du corps d'une page : `- [ ] texte` ou `- [x] texte`, à n'importe quel retrait (sous-tâches). Une case dans un bloc de code n'en est pas une. Rien d'autre n'est lu (ni échéance ni priorité, [PLUS TARD]).
+- **Les tâches ne vivent que dans le texte** : aucune clé YAML, aucun fichier à part. Cocher une tâche ailleurs que dans l'éditeur réécrit seulement le caractère de sa case dans le corps de sa ligne, après avoir vérifié que la ligne est toujours cette tâche (sinon rien n'est écrit) ; Ctrl+Z l'annule comme une frappe.
+- **Onglet Tâches** d'une page, activé par la mise en page (onglet `type: taches`) : les tâches de la page sous le titre de leur section, une saisie « Ajouter une tâche » (écrite sous la dernière tâche du corps, ou à la fin), puis, au choix, les tâches des **lignes liées** (`liees`), au même format que les contenus liés (relation, champs, filtres, tris, `puis` sur 5 niveaux). Une ligne liée sans tâche, ni plus bas, n'apparaît pas. L'onglet affiche le nombre de tâches restantes, lignes liées comprises.
+- **Toutes les tâches** : une entrée de la barre latérale, sous la recherche et l'assistant, ouvre la liste des tâches de toutes les pages de l'espace, par base puis par ligne (le titre ouvre la page). Filtre « À faire » (par défaut) ou « Toutes », et une recherche sur le texte des tâches et le titre des pages. Une tâche cochée là reste affichée jusqu'au départ de la page, pour ne pas disparaître sous le clic.
+- Base synchronisée (§16) ou consultation : les cases se lisent, rien ne se coche.
+
+### Base des tâches [DÉCIDÉ, demandé par Alex le 19/10/2026]
+- Des tâches **hors des textes** : une base de l'espace peut être désignée comme base des tâches. Chacune de ses lignes est une tâche (son titre est le texte de la tâche), avec tout ce qu'une ligne a déjà : champs (échéance, priorité, relation vers un projet), vues, corps, historique. Les cases à cocher des textes restent des tâches comme avant : les deux sources s'additionnent.
+- Clé `taches` de `_espace.yaml`, absente par défaut (rien ne change sans elle) :
+  - `base` : l'identifiant de la base ;
+  - `fait` : la colonne qui dit qu'une tâche est faite, `checkbox` ou `select` ;
+  - `terminees` : pour un `select`, les options qui comptent comme faites (sinon la dernière option). Cocher écrit la première d'entre elles ; décocher écrit la première option qui n'en est pas ;
+  - `echeance` (optionnel) : une colonne `date`, affichée à côté de la tâche (en rouge si passée) et qui la trie ;
+  - `sous_taches` (optionnel) : la relation de la base vers elle-même qui liste les sous-tâches (voir plus bas).
+  Une clé qui ne désigne rien de valide (base absente, colonne d'un autre type) est ignorée, et les Options de la page le disent.
+- **Toutes les tâches** : la base des tâches vient en premier, ses lignes comme des tâches (case, titre qui ouvre la page, échéance), triées par échéance puis sans échéance ; les cases du corps d'une ligne s'affichent dessous, en sous-tâches. Une ligne faite suit le filtre « À faire » comme une case, avec ses sous-tâches. « Ajouter une tâche » en tête de la liste crée une ligne de la base (le texte saisi devient son titre). Les autres bases suivent comme aujourd'hui.
+- **Onglet Tâches** d'une page d'une autre base : si la base des tâches a une relation vers cette base, l'onglet montre d'abord les lignes liées à la page (même format, même tri), avec une saisie qui crée une ligne déjà liée ; puis les cases du texte, sous « Dans le texte », avec leur saisie habituelle. Les tâches restantes comptent les deux.
+- **Réglage** : un bouton « Options » de la page Toutes les tâches ouvre le choix de la base (ou aucune), puis de la colonne « fait », des options terminées et de l'échéance. Sans base désignée, « Toutes les tâches » propose « Créer une base Tâches » : une base `taches` (identifiant dédoublonné si besoin) avec `titre`, `fait` (`checkbox`), `echeance` (`date`) et `priorite` (`select` Haute, Moyenne, Basse), déjà désignée.
+- **Liens d'une tâche** : à côté de chaque tâche, une pastille par relation de la base des tâches (hors sous-tâches), avec les titres des lignes liées ; un clic ouvre le sélecteur de lignes habituel. « Lier » ouvre un sélecteur de lignes de **toutes** les bases (sauf la base des tâches), par recherche.
+- **« @ » dans la saisie** : « @ » suivi de quelques lettres propose les lignes de toutes les bases ; en choisir une l'ajoute en pastille sous la saisie et retire le « @… » du texte. Entrée crée la tâche avec ses liens. Le « @ » du texte d'une page reste une simple référence, il ne crée jamais de relation.
+- **Relation créée à la volée** : lier une tâche à une ligne d'une base sans relation avec la base des tâches crée cette relation (colonne propriétaire dans la base des tâches, nommée d'après la base liée ; colonne miroir dans la base liée, nommée d'après la base des tâches), puis le lien. Pour ne rien changer à l'affichage choisi, les deux nouvelles colonnes sont ajoutées aux colonnes masquées de toutes les vues existantes des deux bases, et en « masqué si vide » dans leurs mises en page. Un message le dit : « Relation Clients ajoutée (masquée dans les vues existantes) ». Comme toute modification de schéma, elle ne s'annule pas par Ctrl+Z ; elle se supprime comme une colonne.
+- **Sous-tâches** : clé `sous_taches` de `taches`, une relation de la base des tâches vers elle-même, côté qui liste les sous-tâches. Une sous-tâche s'affiche sous sa tâche parente, à n'importe quelle profondeur, triée de la même façon ; une tâche faite reste affichée par « À faire » tant qu'une de ses sous-tâches ne l'est pas, et la recherche garde les parents d'une sous-tâche trouvée. Chaque tâche a un bouton « Ajouter une sous-tâche » (saisie sous elle). Sans clé, le premier ajout crée l'auto-relation à la volée (« Tâche parente », propriétaire, et « Sous-tâches », miroir), avec les mêmes règles de masquage, et l'écrit dans `sous_taches`. Une tâche à plusieurs parents apparaît sous chacun (relations multi-valeurs, §5). L'onglet Tâches d'une page de la base des tâches montre ses sous-tâches, avec la saisie qui en crée une.
+- Assistant IA et MCP : une ligne de la base des tâches se crée et se modifie avec les outils des lignes ; `decrire_espace` dit quelle base sert aux tâches et sa colonne « fait ».
+- Base synchronisée (§16) ou consultation : les tâches se lisent, rien ne se coche ni ne se crée. Une base Jira peut ainsi servir de base des tâches en lecture.
+- [PLUS TARD] Changer une case d'un texte en ligne de la base des tâches.
+
+### Exemple `_pages/suivi.yaml`
+
+```yaml
+id: suivi
+nom: Suivi
+defaut: false
+champs:
+  - { cle: statut, affichage: visible }
+  - { cle: echeance, affichage: visible }
+  - { cle: client, affichage: visible }
+  - { cle: jours_restants, affichage: masque_si_vide }
+onglets:
+  - type: proprietes
+  - type: relation
+    relation: taches
+    colonnes: [titre, statut, echeance]
+  - type: taches                           # cases à cocher du corps
+    liees:                                 # optionnel : celles des lignes liées
+      relation: taches
+      filtres:
+        - { colonne: fait, operateur: egal, valeur: false }
+  - type: corps
+contenus:                                  # optionnel : contenus liés sous le corps
+  relation: taches
+  champs: [statut, echeance]               # à côté du titre de chaque tâche
+  filtres:                                 # optionnels, comme dans une vue
+    - { colonne: fait, operateur: egal, valeur: false }
+  tris:
+    - { colonne: echeance, sens: asc }
+  puis:                                    # niveau suivant, dans la base des tâches
+    relation: livrables
+```
+
+### Corps de la page
+- Éditeur Markdown riche qui **produit du Markdown propre** : CodeMirror 6 en aperçu en direct, à la manière d'Obsidian [DÉCIDÉ, demandé par Alex le 02/10/2026, remplace Milkdown].
+  - Le texte s'affiche mis en forme ; la syntaxe (`#` d'un titre, `**` du gras, crochets d'un lien) réapparaît sur la ligne ou le passage où se trouve le curseur, et s'y modifie comme du texte.
+  - Le fichier n'est jamais normalisé : seul ce que l'utilisateur tape le change, ouvrir une page ne le réécrit pas.
+  - Les titres se replient (chevron dans la marge) jusqu'au titre suivant de même niveau ou plus haut ; le repli n'est pas mémorisé.
+  - Une case `- [ ]` se coche d'un clic, qui écrit `- [x]` dans le texte. Un lien s'ouvre au clic, dans un nouvel onglet.
+  - « / » ouvre le menu des blocs (titres, tâche, listes, citation, bloc de code, séparateur) ; Ctrl+B et Ctrl+I mettent en gras et en italique.
+  - **Liens, collage, surlignage, menu du clic droit** [DÉCIDÉ, demandé par Alex le 09/10/2026] :
+    - Ctrl+K sur une sélection en fait un lien `[texte](adresse)` (champ où coller l'adresse) ; sur un lien, change, ouvre ou retire l'adresse. Sans sélection, Ctrl+K reste la recherche globale. Dans l'app de bureau, un lien s'ouvre dans le navigateur du système.
+    - Un collage mis en forme (page web, réponse d'IA, Word) est converti en Markdown (titres, gras, listes, liens, tableaux) ; un texte brut qui est déjà du Markdown se colle tel quel.
+    - Surlignage : `==texte==` en jaune (la syntaxe d'Obsidian), `=={rouge}texte==` pour une autre couleur nommée de l'espace (gris, marron, orange, jaune, vert, bleu, violet, rose, rouge). Ailleurs qu'ici, le jaune s'affiche dans Obsidian, les autres couleurs y gardent `{rouge}` visible. Ctrl+Maj+H surligne en jaune, ou retire le surlignage.
+    - Clic droit sur un mot (il est sélectionné) ou une sélection : menu de mise en forme (gras, italique, barré, code, lien, surlignage par couleur, retirer), couper, copier, coller. Maj+clic droit garde le menu du système (suggestions d'orthographe).
+- **Références à une ligne** [DÉCIDÉ, demandé par Alex le 02/10/2026] : « @ » dans le corps ouvre la liste des lignes de tout l'espace (titre, et nom de la base), filtrée par la suite de la saisie ; choisir une ligne écrit un lien wiki à la manière d'Obsidian, `[[projets/site-vitrine--psite001|Site vitrine]]` : le chemin du fichier sans `.md`, le titre en alias. Aucune clé YAML.
+  - Le lien se résout par l'**id** qui termine le nom du fichier : cherché dans la base du dossier, puis dans toutes les bases. Une ligne renommée (fichier renommé) ou une base renommée reste donc trouvée ; le texte du lien n'est jamais réécrit.
+  - Dans l'éditeur, le lien s'affiche comme une pastille au **titre actuel** de la ligne (l'alias sert seulement si la ligne est introuvable, la pastille est alors barrée) ; un clic ouvre la page, la syntaxe revient quand le curseur la touche. Un lien dans un bloc de code reste du texte.
+  - [PLUS TARD] Liste des pages qui citent une ligne (rétroliens).
+- Pas d'images en V1.
+
+---
+
+## 10. Dashboards
+
+- Listés en haut de la barre latérale, dans l'ordre de `barre_laterale.dashboards` (`_espace.yaml`), puis ceux qu'il ne cite pas. **Réordonnables par glisser-déposer** [DÉCIDÉ, demandé par Alex le 01/10/2026] : un dépôt réécrit la liste complète.
+- **Dupliquer** [DÉCIDÉ, demandé par Alex le 01/10/2026] : depuis le ⋯ (ou le clic droit), le fichier est copié tel quel sous un nouvel id, nommé « <nom> (copie) », placé juste après l'original.
+- Un dashboard = une suite de **rangées empilées verticalement**, chacune d'**un à trois blocs côte à côte** [DÉCIDÉ, demandé par Alex le 12/10/2026 ; deux au plus avant]. Un fichier qui en met plus sur une rangée est lu en passant les suivants à la ligne.
+- **Mise en page libre** [DÉCIDÉ, demandé par Alex le 12/10/2026] :
+  - un bloc se **glisse** par sa poignée (en tête du bloc) : à une autre place de sa rangée, dans une autre rangée qui a de la place, ou entre deux rangées, où il en crée une ;
+  - une rangée se glisse par sa poignée (à sa gauche) entre deux autres ;
+  - **largeur** : tirer la séparation entre deux blocs règle leur part de la rangée ; un double-clic revient aux parts égales. Fichier : `largeur` sur le bloc, en pourcentage de la rangée (entre 10 et 90) ; un bloc sans `largeur` prend une part égale de ce qui reste. Un bloc qui change de rangée perd sa largeur ;
+  - une vue de la base se **copie en vue propre** (menu du bloc), pour la modifier sans toucher à la base ; une vue propre s'**enregistre comme vue de la base** (elle rejoint les onglets de la base, le bloc la montre désormais).
+- **Hauteur d'une rangée** [DÉCIDÉ, demandé par Alex le 01/10/2026] : tirer le bord bas d'une rangée règle la hauteur de ses blocs (une timeline longue, un tableau de beaucoup de lignes) ; un double-clic revient à la hauteur par défaut (380 px). Bornée entre 160 et 2400 px. Fichier : `hauteur` sur la rangée, en pixels.
+- Un bloc = une vue d'une base : soit une **référence** à une vue existante de la base, soit une **vue propre au dashboard**, écrite directement dans le fichier du dashboard, au même format qu'un fichier `_vues/*.yaml`. Une vue propre n'apparaît pas dans la liste des vues de la base.
+
+```yaml
+id: pilotage
+nom: Pilotage
+rangees:
+  - blocs:
+      - { base: projets, vue: kanban-statut }        # référence
+    hauteur: 600                                     # optionnel : hauteur des blocs de la rangée, en pixels
+  - blocs:
+      - base: taches                                 # vue propre au dashboard
+        vue:
+          id: taches-en-retard
+          nom: En retard
+          type: tableau
+          filtres:
+            - { colonne: echeance, operateur: avant, valeur: aujourdhui }
+      - { base: clients, vue: tableau-principal, largeur: 40 }   # largeur : facultative, en % de la rangée
+filtres:                                             # filtres globaux (optionnels)
+  - { base: projets, colonne: statut, operateur: egal, valeur: En cours }
+filtres_rapides:                                     # pastilles globales
+  - { base: projets, valeur: [psite001] }            # sans colonne : des lignes choisies
+  - { base: taches, colonne: priorite, operateur: parmi }
+```
+
+- **Pour l'assistant et Claude (MCP)** [DÉCIDÉ, demandé par Alex le 12/10/2026] : les mêmes possibilités, par les mêmes outils pour les deux.
+  - `creer_dashboard` : des rangées d'un à trois blocs ; chaque bloc montre une vue de la base ou une vue propre (type, filtres, tris, comme `creer_vue`), avec sa largeur.
+  - `modifier_dashboard` : une liste d'opérations appliquées dans l'ordre (renommer, ajouter un bloc à une place donnée, déplacer un bloc ou une rangée, remplacer un bloc, hauteur, largeurs, réglages d'une vue propre, filtres et filtres rapides du dashboard). Les places se comptent à partir de 1 et chaque opération voit le résultat des précédentes.
+  - `retirer_bloc` : à part, marqué destructeur (une vue propre retirée est perdue).
+  - La description de l'espace montre la mise en page de chaque dashboard : rangées, blocs (base, vue, propre ou non, largeur), hauteurs et filtres.
+- **Filtres globaux** [DÉCIDÉ, validé par Alex le 25/09/2026] : un dashboard peut porter des filtres et des filtres rapides qui valent pour tous ses blocs. Chacun porte sur une base (« Projets › Statut = En cours »), qu'elle ait un bloc ou non.
+  - Un bloc de cette base est filtré directement. Un bloc d'une autre base suit ses relations vers elle : il garde les lignes liées à au moins une ligne retenue (les tâches des projets en cours). Un bloc sans relation vers la base filtrée n'est pas filtré, et son en-tête le dit.
+  - Plusieurs bases filtrées se combinent en ET. Ces filtres s'ajoutent à ceux de la vue du bloc, sans les modifier.
+  - Pastille globale sans colonne : le choix de lignes de la base (« Projets : Site vitrine, Boutique »), par cases à cocher. Comme toute pastille, non réglée elle ne filtre rien.
+
+### Analyse : blocs calculés en SQL [DÉCIDÉ, demandé par Alex le 12/10/2026, validé le 12/10/2026]
+
+Des dashboards complexes à la manière de Power BI, à partir des données de l'espace : des chiffres clés, des graphiques et des tableaux calculés par des requêtes SQL, avec des paramètres, des règles de calcul et une mise en forme conditionnelle. Le principe vient d'evidence.dev (requêtes SQL nommées, visuels qui en citent le résultat), sans l'intégrer. Ces blocs vivent dans les dashboards, à côté des blocs vue, avec la même mise en page. Des rapports à part (ancien §20) restent possibles plus tard.
+
+**Moteur**
+- **DuckDB-WASM**, le moteur d'Evidence. Il tourne dans la page, **sans appel réseau** (fichiers du moteur livrés avec l'app, jamais un CDN), et ne se charge qu'à l'ouverture d'un dashboard qui a des requêtes. Le serveur MCP Node (§17) embarque le même moteur.
+- **Lecture seule** : une base en mémoire, recréée à chaque calcul, sans accès aux fichiers ni au réseau. Une requête ne peut rien écrire dans l'espace.
+- Recalculé quand les bases changent (saisie, relecture du dossier) ou qu'un filtre ou un paramètre change.
+
+**Tables**
+- Chaque base est une **table** du nom de son id (`projets`, `taches`), une colonne par clé de colonne, **colonnes calculées comprises** (rollups, formules, Créé le, Modifié le) : on lit ce que l'app affiche. S'y ajoutent `id` et, toujours, `_cree` et `_modifie` (vides quand la ligne ne les a pas).
+- Types : nombre → `DOUBLE`, case à cocher → `BOOLEAN`, date → `DATE` (ou `TIMESTAMP` avec l'heure), le reste → texte. Une **relation** ou un **choix multiple** est une liste (ids des lignes liées, libellés), qu'on déplie par `unnest`. Une cellule en erreur ou vide vaut `NULL`.
+- Les **filtres et filtres rapides du dashboard** valent aussi pour les requêtes : chaque table ne contient que les lignes que le dashboard retient, selon la même règle que les blocs vue (une base filtrée directement, les autres par leurs relations). Une pastille réglée filtre donc tous les visuels, comme un segment Power BI.
+
+**Fichier**
+
+```yaml
+id: pilotage-tickets
+nom: Pilotage tickets
+parametres:
+  - { nom: mois, libelle: Mois, type: mois, defaut: courant }
+  - { nom: equipe, libelle: Équipe, type: choix, options: [Support, Produit], valeur: Support }
+requetes:
+  par_statut: |
+    select statut, count(*) as n
+    from tickets
+    where strftime(cree_le, '%Y-%m') = {{mois}} and equipe = {{equipe}}
+    group by statut order by n desc
+  total: select count(*) as n, count(*) filter (where statut = 'Bloqué') as bloques from tickets
+rangees:
+  - blocs:
+      - { type: valeur, titre: Tickets, donnees: total, valeur: n }
+      - type: valeur
+        titre: Bloqués
+        donnees: total
+        valeur: bloques
+        regles: [{ si: '> 5', couleur: rouge }]
+      - { type: barres, titre: Par statut, donnees: par_statut, x: statut, y: n, largeur: 50 }
+  - blocs:
+      - type: tableau
+        sql: select titre, statut, jours_restants from projets order by jours_restants
+        format: { jours_restants: entier }
+        regles:
+          - { colonne: jours_restants, si: '< 0', couleur: rouge }
+          - { colonne: statut, si: '= Terminé', couleur: vert, ligne: true }
+      - type: texte
+        texte: "**{{total.n}} tickets** ce mois-ci, dont {{total.bloques}} bloqués."
+```
+
+- `requetes` : des requêtes nommées, à partager entre plusieurs blocs. Un bloc peut aussi porter sa propre requête (`sql`) à la place de `donnees`.
+- Un bloc d'analyse a un `type` au lieu d'une `base` ; il garde `largeur`, sa rangée garde `hauteur`, et il se glisse comme les autres. `titre` facultatif.
+
+| `type` | Montre | Réglages |
+| --- | --- | --- |
+| `valeur` | un chiffre clé (première ligne du résultat) | `valeur` (colonne), `comparer` (colonne de référence : écart et flèche), `format`, `regles` |
+| `barres` | barres verticales | `x`, `y` (une colonne ou une liste), `serie` (colonne qui découpe en séries), `empile`, `horizontal`, `format` |
+| `courbe`, `aire` | évolution | `x`, `y`, `serie`, `empile` (aire), `format` |
+| `secteurs` | parts d'un tout | `x` (libellé), `y` (valeur) |
+| `nuage` | deux mesures croisées | `x`, `y`, `serie`, `taille` |
+| `tableau` | le résultat tel quel | `colonnes` (choix et ordre), `format` (par colonne), `regles` |
+| `texte` | du Markdown | `texte`, où `{{requete.colonne}}` cite la première ligne d'un résultat |
+
+- **Format** : `nombre` (par défaut), `entier`, `decimal` (deux chiffres), `pourcent` (un ratio : 0,25 → 25 %), `euros`, `date`. Sur un tableau, un format par colonne. Un rollup en pourcentage (« % cochées ») vaut de 0 à 100 dans sa table, comme à l'écran : on le divise par 100 pour le format `pourcent`.
+- **Mise en forme conditionnelle** (`regles`) : une liste lue dans l'ordre, la première qui s'applique gagne. `si` = un opérateur (`>`, `>=`, `<`, `<=`, `=`, `!=`) et une valeur (nombre, texte, date), ou le nom d'une autre colonne du résultat (`'< objectif'`). `couleur` : une couleur de l'espace (§3). `colonne` : la colonne testée, par défaut la mesure du bloc (`valeur`, ou `y` d'un graphique). Sur un tableau, la cellule testée prend la couleur ; avec `ligne: true`, toute la ligne. Sur un graphique, la règle colore les barres ou les points qui la remplissent.
+- Couleurs des séries : celles des options quand l'axe ou la série est une colonne à choix de la base, sinon la palette de l'espace. Graphiques à la demande (ECharts), aux couleurs du thème clair ou sombre.
+
+**Paramètres**
+- `parametres` : des choix montrés en haut du dashboard, à côté des filtres rapides. `type` : `choix` (`options` : une liste, ou le nom d'une requête dont la première colonne donne les options), `texte`, `nombre`, `date`, `mois` (`courant`, `precedent` ou `AAAA-MM`), `periode` (deux dates). `defaut` : la valeur de départ ; `valeur` : la valeur choisie, écrite dans le fichier comme une pastille.
+- Dans une requête, `{{nom}}` est remplacé par la valeur **en littéral SQL échappé** (jamais collée telle quelle) ; une période donne `{{nom.debut}}` et `{{nom.fin}}`. Un paramètre sans valeur vaut `NULL`.
+- `{{aujourdhui}}` est intégré : la date du jour de l'app, en `DATE`. Le moteur n'a pas l'extension des fuseaux horaires (il ne télécharge rien) : `current_date` et `today()` échouent, avec un message qui renvoie à `{{aujourdhui}}`.
+
+**Erreurs**
+- Une requête en erreur (SQL, table ou colonne inconnue, paramètre absent) montre son message dans chacun de ses blocs ; le reste du dashboard s'affiche. Une colonne de réglage absente du résultat (`x: statut` sans colonne `statut`) le dit dans le bloc.
+- Un résultat se coupe à 5 000 lignes, et le bloc le dit.
+
+**Captures**
+- Menu de chaque bloc : **Copier l'image** et **Enregistrer l'image** (PNG). Menu du dashboard : **Exporter en image** (le dashboard entier, paramètres et filtres réglés compris). C'est le mode de partage : pas de publication en ligne.
+
+**Pour l'assistant et Claude (MCP)**, mêmes outils pour les deux (§17) :
+- `executer_sql` (lecture) : exécute une requête sur les tables de l'espace et renvoie les 200 premières lignes, pour explorer avant d'écrire un bloc. Les filtres d'un dashboard s'appliquent si on le nomme.
+- `creer_dashboard` accepte les blocs d'analyse (un `type` de visuel à la place de `base`), `requetes` et `parametres`. `modifier_dashboard` a quatre opérations de plus : `modifier_bloc` (réglages d'un bloc d'analyse, `nouveau_type` pour changer de visuel, `null` retire un réglage), `requete` (ajouter, remplacer, ou retirer avec `sql: null` ; refusé tant qu'un bloc s'en sert), `parametres` (remplace la liste) et `valeur_parametre`.
+- Chaque requête est exécutée avant d'être acceptée : une erreur SQL, ou une colonne de réglage absente du résultat, refuse l'appel avec son message. Un réglage inconnu est refusé en listant ceux qui existent.
+- La description de l'espace donne les tables SQL (colonnes et types), et, pour chaque dashboard, ses requêtes, ses paramètres et ses blocs d'analyse.
+
+### Fiches : blocs visuels, sélecteur de ligne et règles déclarées [DÉCIDÉ, demandé par Alex le 16/10/2026, validé le 19/10/2026]
+
+Une fiche se lit en 10 secondes : ce qui arrive, ce qui bloque, où en est chaque élément. Cible : la maquette de fiche projet du 16/10/2026 (sélecteur de projet, trois comptes à rebours, barres d'étapes datées, frise, barre de répartition, listes de risques et de points d'attention). Tout s'appuie sur l'analyse ci-dessus : chaque nouveau bloc lit une requête nommée (`donnees`) ou la sienne (`sql`), et toutes les clés sont facultatives, un fichier existant se relit à l'identique.
+
+**Rendu**
+- La couleur ne dit qu'un état : vert, orange, rouge, bleu pour planifié, gris pour vide. Les modèles proposés par l'assistant s'y tiennent.
+- Chaque bloc est une carte blanche à ombre légère sur fond gris clair, titre en petites capitales grasses, dans **tous les dashboards** (blocs vue compris) ; un titre peut citer un résultat (`{{requete.colonne}}`), comme un texte.
+- Tout se lit sans survol : le survol ne fait que compléter (raison d'un état, date d'une étape).
+- Sous 400 px de large, les blocs d'une rangée passent l'un sous l'autre.
+
+**Couleurs**
+- Partout où une couleur est attendue : une des couleurs de l'espace (§3) ou un hexadécimal (`'#2f6fc2'`). Deux valeurs de plus : `vide` (gris clair, « à planifier ») et `aucune` (contour pointillé, « sans objet »).
+- `couleurs` (en tête du dashboard) : des tables valeur → couleur, nommées, réutilisées par les blocs. Une valeur absente de la table est `vide`.
+- Thème de l'espace, dans `_espace.yaml` : `theme: { couleurs: { vert: '#2e9e5b', … }, police: …, logo: <chemin dans l'espace> }`. Les couleurs nommées y prennent leur teinte exacte (`#rrggbb`) dans les graphiques et les fiches, la police s'applique aux dashboards ; le logo, un fichier SVG de l'espace (affiché en image, il n'exécute rien), s'affiche dans l'en-tête des fiches et donc dans leurs captures. Une valeur mal formée est ignorée.
+
+**États** (`etats`, en tête du dashboard)
+- Un état classe une ligne de résultat : une liste ordonnée de conditions, la première vraie gagne, sinon la dernière entrée sans `si`. Chaque entrée : `si` (une **expression SQL** sur les colonnes du résultat), `couleur`, `libelle`, `raison` (montrée au survol, « Calculé : … »).
+- Il est déclaré une fois et servi partout : pastilles du sélecteur, en-tête de fiche, pastilles d'une liste. Rien n'est codé en dur dans l'app.
+
+**Sélecteur de ligne**
+- Un paramètre `choix` avec `affichage: boutons` : une rangée de boutons en tête du dashboard, un par option, avec `pastille: <état>` calculé sur la ligne de la requête d'options. Au-delà de 12 options, une liste avec recherche.
+- Le choix est **retenu sur la machine** (stockage du navigateur ou de l'app de bureau), jamais écrit dans le fichier : changer de projet, c'est consulter, pas modifier, et le dossier synchronisé ne bouge pas. Sans choix retenu, `defaut`, sinon la première option. Le choix marche aussi en mode consultation.
+- Choisir recalcule tout le dashboard d'un coup (un seul rendu, pas de blocs qui clignotent).
+
+**Nouveaux blocs**
+
+| `type` | Montre | Réglages |
+| --- | --- | --- |
+| `entete` | titre, sous-titre et état d'une ligne, sans carte | `titre`, `sous_titre` (colonnes), `etat` (nom d'un état) |
+| `compte_a_rebours` | « J-n » de la date à venir la plus proche du résultat, son libellé et sa date ; liseré et chiffre colorés | `date`, `libelle`, `seuils` (défaut `[8, 31]` : rouge sous 8 jours, orange sous 31, vert au-delà), `vide` (défaut « Aucune date à venir saisie ») |
+| `etapes` | une ligne par élément, une case par étape dans l'ordre fixé, bandeau d'en-tête aux noms courts, date facultative sous chaque case | `element`, `etape`, `statut`, `date` (colonnes), `etapes` (liste ordonnée, `{ nom, court }`), `couleurs` (table), `groupe` et `detail_groupe` (titre de groupe et sa ligne grise) |
+| `liste` | pastille, libellé gras, détail gris | `libelle`, `detail`, `pastille` (colonne passée par une table `couleurs`, ou un état), `garder` (expression SQL), `tri` (expression SQL), `max`, `vide` (message) |
+| `repartition` | une barre fine empilée, légende en ligne avec les nombres ; une catégorie à zéro est masquée | `x` (catégorie), `y` (nombre), `ordre`, `couleurs` |
+| `frise` | des bandes par ligne sur une échelle de temps, ligne « aujourd'hui », mois en tête | `ligne`, `debut`, `fin`, `categorie`, `previsionnel` (colonne vraie : contour pointillé), `couleurs`, `jalons` et `periodes` (voir ci-dessous) |
+
+- `etapes` lit le résultat **une ligne par élément et par étape** (`element`, `etape`, `statut`, `date`) : une étape absente du résultat est `vide`. Une base qui range ses étapes en colonnes se déplie par `unpivot` ; les dates prises dans des lignes liées (phases d'un lot, jalons d'une version) se joignent dans la requête, pas dans le bloc. Une date à venir dans les `seuils` prend leur couleur.
+- `liste` : `garder` et `max` écartent des lignes, jamais en silence. Un lien « N autres » montre ce qui a été écarté. Une condition `garder` qui vaut `NULL` (colonne vide : `etat <> 'Fait'` sur une ligne sans état) garde la ligne.
+- `frise` : fenêtre automatique, du début du mois d'il y a deux semaines à la fin du mois de la dernière date. `jalons: { donnees, date, libelle, ligne, couleur }` dessine des losanges, sur leur ligne ou en tête quand `ligne` manque. `periodes: { donnees, debut, fin, libelle }` dessine des bandes hachurées sur toute la hauteur (moratoires, gels).
+
+**Fichier** (la fiche projet de la maquette, en abrégé)
+
+```yaml
+id: fiche-projet
+nom: Fiche projet
+couleurs:
+  etape: { Fait: vert, En cours: orange, Planifié: bleu, N/A: aucune }
+  phase: { Développement: '#c9d6ea', Recette interne: bleu, Recette client: '#8fb0dc', Recette métier: orange, Stabilisation: gris }
+etats:
+  meteo:
+    - { si: 'risque_max >= 6 or bloques > 0', couleur: rouge, libelle: Vigilance forte, raison: 'risque de criticité 6 ou plus, ou point bloqué' }
+    - { si: 'risque_max >= 3 or a_surveiller > 0', couleur: orange, libelle: A surveiller, raison: 'risque orange ou point à surveiller' }
+    - { couleur: vert, libelle: Nominal, raison: 'aucun risque ni point bloquant' }
+parametres:
+  - { nom: projet, type: choix, options: projets, affichage: boutons, pastille: meteo }
+requetes:
+  projets: |
+    select p.titre, max(r.criticite) as risque_max,
+      count(*) filter (where pt.etat in ('Bloqué', 'KO')) as bloques,
+      count(*) filter (where pt.etat in ('Vigilance', 'A surveiller', 'En attente', 'A faire')) as a_surveiller
+    from projets p left join risques r on list_contains(r.projet, p.id) left join points pt on list_contains(pt.projet, p.id)
+    group by p.titre order by p.titre
+  fiche: select * from projets_suivis where titre = {{projet}}
+  recettes_internes: select version || ' ' || lot as libelle, debut as date from phases where projet = {{projet}} and type = 'Recette interne'
+  etapes: select version, statut_version, lot, etape, statut, date from etapes_des_lots where projet = {{projet}}
+  planning: select lot, type, debut, fin, previsionnel from phases where projet = {{projet}}
+rangees:
+  - blocs:
+      - { type: entete, donnees: fiche, titre: titre, sous_titre: resume, etat: meteo }
+  - blocs:
+      - { type: compte_a_rebours, titre: Début recette interne, donnees: recettes_internes, date: date, libelle: libelle }
+      - { type: compte_a_rebours, titre: MEP, sql: "select titre as libelle, mep as date from versions where projet = {{projet}}", date: date, libelle: libelle }
+  - blocs:
+      - type: etapes
+        titre: Pipeline
+        donnees: etapes
+        element: lot
+        etape: etape
+        statut: statut
+        date: date
+        groupe: version
+        detail_groupe: statut_version
+        couleurs: etape
+        etapes: [{ nom: Validation US, court: Valid. US }, { nom: Chiffrage planning, court: Chiffrage }, { nom: Recette métier, court: Rec. métier }]
+  - blocs:
+      - type: frise
+        titre: Planning
+        donnees: planning
+        ligne: lot
+        debut: debut
+        fin: fin
+        categorie: type
+        previsionnel: previsionnel
+        couleurs: phase
+        jalons: { sql: "select titre, mep from versions where projet = {{projet}}", date: mep, libelle: titre }
+        periodes: { sql: "select titre, debut, fin from moratoires", debut: debut, fin: fin, libelle: titre }
+  - blocs:
+      - type: liste
+        titre: Points d'attention
+        sql: select titre, detail, etat, _modifie from points where projet = {{projet}}
+        libelle: titre
+        detail: detail
+        pastille: etat
+        couleurs: { Bloqué: rouge, KO: rouge, Vigilance: orange, A surveiller: orange, En attente: orange, A faire: orange }
+        garder: "etat not in ('Fait', 'Validé', 'Planifié')"
+        tri: "case when etat in ('Bloqué', 'KO') then 0 when etat is not null then 1 else 2 end, _modifie desc"
+        max: 4
+        vide: Aucun point ouvert
+```
+
+**Pour l'assistant et Claude (MCP)**
+- `creer_dashboard` et `modifier_dashboard` acceptent les nouveaux blocs, `couleurs`, `etats` et les réglages du sélecteur ; `modifier_dashboard` gagne les opérations `couleurs` (`nom`, `table`) et `etat` (`nom`, `entrees`), qui ajoutent ou remplacent la table ou l'état nommé ; `null` le retire. Un état ou une table encore utilisé par un bloc ne se retire pas.
+- Les expressions d'un état et `garder` / `tri` d'une liste sont du SQL écrit par le modèle : même garde-fous que `executer_sql` (lecture seule, aucune extension chargée), et chacune est exécutée avant d'être acceptée, comme une requête.
+- La description de l'espace montre, pour chaque dashboard, ses tables de couleurs et ses états.
+
+**Plus tard** (hors de ce lot) : filtres dynamiques (curseur de période, filtre croisé au clic sur une barre ou une pastille) ; dates de référence (date contractuelle figée face à la date actuelle, trait fin sur la frise, écart sur le compte à rebours) ; modèles de dashboards pour l'assistant (« Fiche projet ») ; mode présentation plein écran et export PDF ; édition à la main façon outil de BI.
+
+---
+
+## 11. Recherche globale
+
+- Raccourci `Ctrl+K`.
+- Recherche plein texte sur titres, champs texte et corps de toutes les bases.
+- Résultats groupés par base, ouverture de la page en un clic.
+- Index en mémoire (MiniSearch ou équivalent), mis à jour à chaque écriture.
+
+Précisions d'implémentation :
+- MiniSearch. Poids : titre ×3, champs texte (text, url) ×1,5, corps ×1. Tous les mots doivent être présents ; débuts de mots et petites fautes acceptés ; accents et casse ignorés.
+- L'index suit l'état affiché (pas seulement l'écrit) : une modification est trouvable avant d'être écrite. Seules les lignes dont le texte a changé sont réindexées.
+- Un résultat donne un extrait (champs texte, sinon corps) avec les mots trouvés surlignés. Les groupes suivent l'ordre du meilleur résultat de chaque base.
+
+---
+
+## 12. Architecture
+
+```
+┌─────────────────────────────────────────┐
+│ UI (React)                              │
+├─────────────────────────────────────────┤
+│ Store applicatif (état UI, vues)        │
+├─────────────────────────────────────────┤
+│ CŒUR (TypeScript pur, zéro dépendance   │
+│ UI) : parsing, schéma, index, graphe    │
+│ de dépendances, rollups, formules,      │
+│ filtres, tris, recherche, écriture      │
+├─────────────────────────────────────────┤
+│ Adaptateur fichiers (interface)         │
+│  └ impl. File System Access API (V1)    │
+│  └ impl. Tauri / Obsidian (PLUS TARD)   │
+└─────────────────────────────────────────┘
+```
+
+### Règles d'architecture
+- **Le cœur n'importe ni React, ni le DOM, ni l'API navigateur.** Il doit tourner tel quel dans Node pour les tests, et demain dans un plugin Obsidian ou derrière Tauri.
+- **L'adaptateur fichiers** expose une interface minimale : `lister`, `lire`, `ecrire`, `renommer`, `supprimer`, `dateModification`. Aucune autre partie du code ne touche au système de fichiers.
+- **Index en mémoire** : au chargement, tous les fichiers sont lus et parsés ; chaque colonne (stockée ou calculée) a une valeur concrète pour chaque ligne. Filtres, tris et groupements opèrent sur cet index.
+- **Recalcul incrémental** : une modification ne recalcule que les colonnes qui en dépendent (via le graphe).
+- **Écriture** : debounce par fichier (~300 ms), écriture complète du fichier via l'API d'écriture du navigateur.
+
+### Stack
+- TypeScript strict, Vite.
+- React ; TanStack Table + TanStack Virtual (tableaux virtualisés) ; dnd-kit (glisser-déposer).
+- Calendrier et timeline : implémentation maison (les librairies gèrent mal les jalons ; les meilleures timelines sont payantes).
+- `yaml` (eemeli/yaml) pour le frontmatter avec préservation du formatage.
+- Éditeur de corps : CodeMirror 6 (aperçu en direct).
+- MiniSearch pour la recherche.
+- Vitest pour les tests du cœur.
+
+### Environnement navigateur
+- API File System Access : fonctionne sur **Chrome et Edge** (cible Windows), pas sur Firefox ni Safari. Afficher un message clair sur les navigateurs non compatibles.
+- Le handle du dossier est conservé dans IndexedDB pour ne pas redemander le dossier à chaque ouverture (seule la permission est redemandée).
+- **Changements externes** (synchro OneDrive depuis une autre machine) : le navigateur ne peut pas surveiller le dossier. À chaque retour sur l'onglet (`visibilitychange` / `focus`), rescanner les dates de modification et recharger les fichiers modifiés. Bouton de rafraîchissement manuel en complément. (Jalon 12 : relecture de tout l'espace, dates des lignes comparées, fichiers de configuration relus ; une relecture croisée par une écriture de l'app est jetée et refaite au coup suivant.)
+- Application **100 % statique** : aucun appel réseau, aucune télémétrie.
+- **Application installable (PWA)** [DÉCIDÉ, demandé par Alex le 01/10/2026] : Chrome et Edge proposent « Installer mdbase » (icône dans la barre d'adresse) : fenêtre à part, icône dans le menu Démarrer et la barre des tâches, sans signature ni installeur. Un service worker (`pwa/sw.js`, liste des fichiers injectée au build) garde le build pour ouvrir l'app hors ligne : la page passe par le réseau d'abord, les fichiers du build (noms hachés) par le cache d'abord, un cache par version. Il n'intercepte que l'app elle-même : ni les fichiers de l'espace (lus par l'API de fichiers), ni les appels de l'assistant IA. Une installation reste dans le cadre du navigateur : elle ne lève aucune restriction réseau (CORS).
+
+### Module IA [DÉCIDÉ]
+Exception à « aucun appel réseau » (validée par Alex le 25/09/2026, après la V1). La seule autre : la synchro Jira de l'app de bureau (§16), activée par le module Jira et une connexion saisie par l'utilisateur.
+- **Désactivé par défaut.** L'activer affiche d'abord un avertissement qui dit quelles données partent et vers quelle adresse ; rien n'est envoyé avant l'activation.
+- **Connecteur générique** : tout service compatible OpenAI (`/chat/completions` avec appels d'outils), distant ou local. L'utilisateur fournit l'adresse, sa clé et le nom du modèle ; la clé reste dans son navigateur. Aucun fournisseur imposé, aucune clé embarquée. Les principaux services sont préremplis [DÉCIDÉ, demandé par Alex le 02/10/2026] : un clic sur Anthropic, Google Gemini, OpenAI, Mistral, OVH, Ollama ou LM Studio remplit l'adresse et un modèle par défaut, avec un lien vers la page où créer sa clé ; il ne reste qu'à coller la clé. Le modèle se change parmi ceux que le service liste.
+- **Périmètre** : le modèle ne voit et ne modifie que l'espace ouvert. Il ne touche jamais aux fichiers : il propose des opérations typées (outils), que le cœur valide comme une saisie de l'interface (colonnes, types, options, lignes existantes).
+- **Aperçu obligatoire** : toute écriture proposée est montrée (lignes, colonnes, avant → après) et n'est appliquée qu'après confirmation. Une proposition invalide est refusée en entier, jamais appliquée à moitié.
+- Le cœur définit l'interface du modèle et les outils ; l'appel réseau vit dans un adaptateur.
+- **Conversation** : les derniers échanges sont renvoyés au modèle ; le fil est gardé dans le navigateur (brouillon, pas dans le dossier).
+- **Panneau** [DÉCIDÉ, validé par Alex le 27/09/2026] : l'assistant vit dans un panneau à droite du contenu, redimensionnable, ouvert et fermé par `Ctrl+J` / `⌘J` ; la base reste visible pendant la conversation. La conversation n'appartient pas au panneau : le fermer, changer de base ou passer en consultation n'arrête pas une demande en cours, et le bouton de la barre latérale signale une demande qui tourne ou une proposition à relire.
+- **Réponse au fil de l'eau** [DÉCIDÉ, validé par Alex le 27/09/2026] : la requête est envoyée en `stream` ; le texte s'affiche à mesure qu'il arrive. Pas de délai total : une demande n'est abandonnée qu'après 30 min sans rien recevoir (certains modèles réfléchissent longtemps sans rien envoyer) ; avant, c'est l'utilisateur qui décide d'arrêter. « Arrêter » coupe réellement la requête ; un tour arrêté est gardé dans le fil avec le texte déjà reçu. Un service qui ignore `stream` et répond d'un bloc reste accepté.
+- **Lire avant d'agir** [DÉCIDÉ, demandé par Alex le 02/10/2026] : au-delà de 150 lignes, le contexte n'en donne qu'un extrait. Deux outils de lecture, sans effet sur les fichiers : `chercher_lignes` (une base, des filtres et des tris comme une vue ; toutes les lignes qui répondent, 200 au plus, valeurs complètes, calculées comprises) et `lire_page` (le contenu d'une page). Le modèle lit sur plusieurs tours (8 au plus) en voyant chaque résultat, puis envoie ses modifications en une réponse ; une modification envoyée avec une lecture n'est pas retenue à ce tour. Deux relances au plus, après un refus ou une réponse coupée par le service (`finish_reason: length`) ; ensuite, les appels valides sont proposés et ce qui reste refusé est signalé dans le message, plutôt que de tout perdre.
+- **Dans le panneau** [DÉCIDÉ, validé par Alex le 27/09/2026] : réponses rendues en Markdown (titres, listes, gras, code, tableaux, liens web seulement), sans jamais injecter de HTML ; « Copier » sur chaque réponse ; la dernière demande se relance ou se reprend pour modification, sauf si son plan a été appliqué. `@` cite une base (ses lignes accompagnent la demande comme celles de la base ouverte), `/` en tête de demande choisit un skill que le modèle est prié d'appliquer. Le modèle se change depuis le pied du panneau (liste demandée au service). Historique : 20 conversations par dossier, gardées dans le navigateur ; une conversation reprise relit ses échanges mais ses plans ne sont plus applicables.
+- **Mémoire** (`_assistant/memoire.md`, §3) : le modèle retient un fait quand l'utilisateur le demande ou exprime une préférence durable ; écrit aussitôt, avec une mention « Retenu : … » annulable. Jamais une valeur de ligne.
+- **Skills** (`_assistant/skills/`, §3) : procédures nommées créées à la demande de l'utilisateur, avec confirmation comme une modification de données. Les skills et la mémoire sont envoyés au modèle avec la structure de l'espace, et l'avertissement d'activation le dit.
+- **Structure** : le modèle peut aussi créer une base, ajouter, renommer ou supprimer des colonnes (tous les types, relations avec leur miroir, rollups, formules), créer, régler ou supprimer des vues (filtres, groupes OU, filtres rapides, tris, groupement, ordre des colonnes et colonnes masquées, champs des cartes, réglages du tableau, titres et champs des niveaux dépliés ; une modification ne touche qu'aux réglages passés, les défauts comme la date de début ne valent qu'à la création) [DÉCIDÉ, demandé par Alex le 12/10/2026], créer, réorganiser ou supprimer des dashboards, ranger une base dans un groupe de la barre latérale (groupe créé s'il n'existe pas, outil `placer_base`) [DÉCIDÉ, demandé par Alex le 09/10/2026], supprimer des lignes et écrire le contenu d'une page. Les appels d'une même réponse sont validés dans l'ordre sur un brouillon de l'espace : une colonne ou une base créée peut être remplie aussitôt. Application dans l'ordre structure, puis données, puis suppressions de lignes et contenu.
+- **Connaissance** (contexte, documents, inbox, budget) : §18.
+- **Suppressions** : toujours dans l'aperçu, en rouge, avec leur portée (lignes touchées, liens retirés). Supprimer une base est possible, seulement à la demande explicite de l'utilisateur. Les données s'annulent d'un Ctrl+Z comme une action de l'utilisateur ; une base, une colonne, une vue ou un dashboard supprimé ne revient pas, et l'aperçu le dit (« définitif »).
+
+---
+
+## 13. Invariants (à tester)
+
+1. Aucune valeur calculée n'est jamais écrite dans un fichier de ligne.
+2. Ajouter ou retirer un lien de relation modifie exactement un fichier.
+3. Renommer une colonne ne modifie aucun fichier de ligne.
+4. Déplacer une base entre groupes ne modifie que `_espace.yaml`.
+5. Un champ inconnu du schéma survit à toute réécriture du fichier.
+6. Relire un fichier que l'app vient d'écrire redonne exactement les mêmes valeurs (aller-retour stable).
+7. Aucune configuration acceptée ne contient de boucle de dépendances.
+8. Aucune formule ne peut exécuter de code arbitraire.
+9. Une ligne créée depuis une vue filtrée sur `egal` / relation satisfait ces filtres.
+
+---
+
+## 14. Ordre de construction suggéré
+
+Avancer jalon par jalon, chaque jalon livrable et testé avant le suivant.
+
+1. **Socle** — projet Vite + TS, cœur isolé, adaptateur File System Access, ouverture d'un dossier, persistance du handle.
+2. **Lecture/écriture** — parsing des lignes et du schéma, lecture tolérante, écriture préservant le formatage, tests d'aller-retour.
+3. **Tableau minimal** — une base, types simples (`text`, `number`, `date`, `checkbox`, `select`, `multiselect`, `url`), édition inline, `+` pour créer une ligne, sauvegarde instantanée.
+4. **Gestion du schéma** — créer une base, ajouter / renommer / réordonner / supprimer des colonnes depuis l'interface. Barre latérale et groupes.
+5. **Filtres, tris, filtres rapides** — y compris héritage à la création et ligne persistante colorée.
+6. **Relations et rollups** — index, graphe de dépendances, stockage propriétaire, édition des deux côtés, rollups de rollups, détection de boucles.
+7. **Pages** — panneau latéral, plein écran, éditeur de corps, mises en page, onglets relation.
+8. **Vues** — groupement dans le tableau, kanban, collection.
+9. **Vues temporelles** — calendrier, timeline avec jalons.
+10. **Formules** — interpréteur sandboxé, niveaux 1 et 2, éditeur avec autocomplétion.
+11. **Dashboards et recherche globale.**
+12. **Robustesse synchro** — rechargement sur focus, détection des conflits OneDrive, ids en double, liens cassés.
+
+---
+
+## 16. Intégration Jira [PROPOSÉ, demandé par Alex le 01/10/2026]
+
+But : relier des lignes à des tickets Jira Cloud et en faire des rollups (statut des tickets d'un projet, tickets non terminés, prochaine échéance). **Lecture seule** : rien n'est jamais écrit dans Jira.
+
+### Principe
+- Jira Cloud refuse les appels venant d'une page web (CORS) : la page ne parle jamais à Jira. Un **script de synchro** (`mdbase-jira.mjs`, un seul fichier, Node seul requis, téléchargeable depuis le site) lit Jira et écrit les tickets dans l'espace, en fichiers ordinaires.
+- Une **base Jira** : une base comme les autres (§3), marquée par une clé `source` dans son schéma. Un fichier par ticket. L'app l'affiche, la filtre, la relie et en fait des rollups comme toute base, mais la garde **en lecture seule**.
+- La correspondance ticket → ligne est une fonction pure du cœur (`src/core/jira/`), séparée de l'accès réseau : le script et l'app de bureau l'utilisent tous les deux.
+
+### Schéma d'une base Jira
+
+```yaml
+version: 1
+id: jira
+nom: Jira
+champ_titre: titre
+source:
+  type: jira
+  site: exemple.atlassian.net
+  projets: [APP, ABC]          # choisis dans l'app (réglages de la base)
+  jql: "status != Abandonné"    # optionnel : filtre ajouté à la sélection par projets
+colonnes:
+  - { cle: titre, nom: Ticket, type: text }                 # « APP-123 Résumé »
+  - { cle: cle, nom: Clé, type: text }                      # APP-123
+  - { cle: resume, nom: Résumé, type: text }
+  - { cle: statut, nom: Statut, type: select, options: [...] }
+  - { cle: etat, nom: État, type: select, options: [À faire, En cours, Terminé] }
+  - { cle: type, nom: Type, type: select, options: [...] }
+  - { cle: priorite, nom: Priorité, type: select, options: [...] }
+  - { cle: assigne, nom: Assigné, type: text }
+  - { cle: sprint, nom: Sprint, type: multiselect, options: [...] }
+  - { cle: versions, nom: Versions corrigées, type: multiselect, options: [...] }
+  - { cle: echeance, nom: Échéance, type: date }
+  - { cle: parent, nom: Epic parent, type: text }           # « APP-10 Refonte du portail »
+  - { cle: labels, nom: Labels, type: multiselect, options: [...] }
+  - { cle: cree, nom: Créé le, type: date }
+  - { cle: maj, nom: Mis à jour le, type: date }                # date et heure, côté Jira (un commentaire compte)
+  - { cle: bouge, nom: Bougé le, type: date }                   # date et heure de la synchro qui a vu changer un champ suivi
+  - { cle: changement, nom: Dernier changement, type: text }    # « Statut : En revue (était En cours) »
+  - { cle: lien, nom: Lien, type: url }
+  - { cle: suivi, nom: Suivi, type: checkbox }
+  - { cle: jira_id, nom: Id Jira, type: text }              # id interne Jira : sert à retrouver le ticket
+```
+
+- `source` : la seule nouvelle clé. Sa présence rend la base **en lecture seule** dans l'app (cellules, corps, création et suppression de lignes, colonnes) ; vues, filtres, tris, mises en page et relations **vers** elle restent libres.
+- Le script crée la base si elle manque, et complète les options des select au fil des tickets. `etat` est la catégorie de statut de Jira (À faire, En cours, Terminé), stable quel que soit le workflow : c'est elle qui sert aux rollups « non terminés ». Couleurs : gris, bleu, vert. Les options du statut sont rangées par catégorie (à faire, en cours, terminé) à chaque synchro, dans l'ordre d'arrivée au sein d'une catégorie [DÉCIDÉ, demandé par Alex le 02/10/2026] : un kanban par statut a ses colonnes dans l'ordre du travail.
+- **Voir ce qui a bougé** [demandé par Alex le 01/10/2026] : quand une synchro trouve un champ suivi modifié (statut, assigné, sprint, échéance…), elle note `bouge` (date et heure de la synchro) et `changement` (les champs modifiés, nouvelle valeur puis l'ancienne entre parenthèses, séparés par « ; »). Trier par « Bougé le », ou filtrer « Bougé le = aujourd'hui », donne les tickets qui ont bougé. Un ticket nouveau dans la sélection : `changement: Nouveau`. `maj` reste la date de Jira, qui avance aussi pour un simple commentaire.
+- Colonnes propres à l'utilisateur : refusées dans une base Jira (lecture seule). Une colonne retirée du schéma n'est plus écrite par le script.
+
+### Fichier d'un ticket
+```markdown
+---
+id: k3f9a2xq                 # id de ligne mdbase, aléatoire, stable (§3)
+jira_id: "10423"             # id interne Jira, stable même si le ticket change de projet
+titre: APP-123 Export des factures en PDF
+cle: APP-123
+statut: En revue
+etat: En cours
+...
+suivi: true
+---
+Description du ticket, convertie en Markdown.
+```
+- Le script retrouve un ticket par `jira_id`, jamais par nom de fichier : l'id de ligne ne change pas, les relations tiennent.
+- Corps : la description Jira (format ADF) convertie en Markdown (titres, listes, gras, italique, code, liens, tableaux simples). Le reste devient du texte.
+- Un ticket qui sort de la sélection (projet retiré, filtre, ticket supprimé dans Jira) **n'est jamais effacé** : il garde ses valeurs et passe à `suivi: false`. Les relations vers lui restent. Le supprimer reste un geste de l'utilisateur.
+
+### Dans l'app
+- Créer : « Nouvelle base Jira » (site, projets, filtre JQL facultatif). Une vue tableau est écrite avec la base : les tickets qui ont bougé en tête (« Bougé le » décroissant), titre, statut, dernier changement, assigné, priorité, type et sprint ; les autres colonnes restent dans les pages. Réglages de la base (bandeau en haut de la base) : site, projets suivis, filtre JQL.
+- Relier : une colonne relation vers la base Jira. La recherche de la relation trouve un ticket par son numéro (`123` ou `APP-123`), puisque la clé est dans le titre.
+- Ce que l'app affiche d'une base Jira : un bandeau avec la dernière synchro, lue dans `jira/_synchro.yaml` (écrit par le script : date, nombre de tickets, dernière erreur), l'erreur du dernier passage s'il a échoué, et un doute si la synchro date de plus de 30 minutes. Tant que la base n'a jamais été synchronisée, il explique comment lancer le script et propose de le télécharger (publié à côté de l'app).
+
+### Le script
+- `node mdbase-jira.mjs <dossier de l'espace>` : une synchro. `--suivre` : reste ouvert, resynchronise toutes les 5 minutes et relit les réglages de la base à chaque passage.
+- Synchro incrémentale : seuls les tickets mis à jour depuis la dernière synchro sont relus (avec une marge de 24 heures : le fuseau horaire de Jira peut différer de celui du poste) ; une synchro complète au premier passage, après un changement de projets ou de filtre, et toutes les heures avec `--suivre` (pour voir les tickets sortis de la sélection). Un fichier n'est réécrit que si une valeur a changé.
+- API : Jira Cloud REST v3, recherche JQL paginée, authentification e-mail + token d'API (token classique : un token à portées ne s'utilise que par la passerelle `api.atlassian.com`, et l'adresse du site le refuse en 401). Un 401 peut aussi venir d'un administrateur qui a coupé les tokens d'API des comptes de l'entreprise (Atlassian Guard).
+- **Le token ne va jamais dans l'espace ni dans le dépôt.** Demandé au premier lancement avec l'e-mail, puis gardé hors de l'espace : chiffré par Windows pour la session (DPAPI) sous `%APPDATA%\mdbase\`, dans le trousseau sur macOS. `--oublier` l'efface.
+- Une colonne ajoutée au script après la création d'une base (ex. Projet) est posée dans son schéma au passage suivant, qui relit alors tous les tickets ; la remplir ne compte pas comme un mouvement (« Bougé le » inchangé).
+- `--demarrage` (Windows) : après un passage réussi, copie le script dans `%LOCALAPPDATA%\mdbase\` (hors des Téléchargements) et pose `mdbase-jira.cmd` dans le dossier Démarrage de l'utilisateur, qui relance `--suivre` à chaque ouverture de session, fenêtre réduite, sans droits administrateur. `--sans-demarrage` le retire. Le bandeau de la base (bouton « Script ») donne le téléchargement et les deux commandes à copier : l'app ne connaît pas le chemin du dossier de l'espace, le script si.
+- [PLUS TARD] plusieurs scripts sur un même espace partagé (verrou).
+
+### Dans l'app de bureau [DÉCIDÉ, demandé par Alex le 09/10/2026]
+
+L'app de bureau n'a pas la restriction CORS : elle synchronise elle-même, sans script. Le script reste pour la PWA (navigateur).
+
+- **Même synchro** : la fonction du cœur (`synchroniser`), avec un client Jira dont les requêtes partent du code natif (Rust). Seules adresses appelées : `https://<site de la base>/rest/api/3/…`, en lecture.
+- **Connexion** : e-mail Atlassian et token d'API, saisis dans le bandeau de la base Jira (« Connexion »), une fois par site. Vérifiés auprès de Jira avant d'être gardés ; gardés dans le gestionnaire d'identifiants du système (Windows, trousseau sur Mac), jamais dans l'espace, le dépôt ni le stockage du navigateur. Le token n'est jamais renvoyé à l'interface : le code natif ajoute l'authentification à chaque requête. « Oublier » l'efface. Un token refusé (401) redemande la connexion.
+- **Quand** : seulement app ouverte, et module Jira activé (§19). Un passage à l'ouverture de l'espace, puis toutes les 5 minutes, synchro complète au moins toutes les heures (comme `--suivre`). Bouton « Synchroniser » dans le bandeau pour un passage tout de suite. L'espace est relu après chaque passage.
+- **Bandeau** : plus de bouton « Script » ni d'explication du script ; « Connexion » (qui montre l'e-mail connecté) et « Synchroniser ». Sans connexion, le bandeau propose de la saisir, avec le lien vers la page Atlassian où créer un token.
+- **Script déjà installé** : si le lancement au démarrage du script (`mdbase-jira.cmd` dans le dossier Démarrage) existe, le bandeau le signale (deux synchros écriraient la même base) et propose « Retirer le lancement au démarrage ». Rien n'est retiré sans ce clic.
+
+---
+
+## 17. Serveur MCP et app de bureau [DÉCIDÉ, demandé par Alex le 07/10/2026]
+
+But : piloter l'espace depuis un client MCP (Claude Desktop), puis une app de bureau Tauri (Windows d'abord, puis Mac) qui installe nativement des plugins comme Jira.
+
+### Serveur MCP (premier livrable)
+- Paquet **`mdbase.mcpb`**, publié avec le site : un double-clic l'installe dans Claude Desktop (Mac, Windows), qui fournit lui-même Node ; ni droits administrateur ni installation de Node. À l'installation, on choisit le dossier de l'espace.
+- Il ne dépend pas de l'app : il lit et écrit les fichiers de l'espace par le cœur (`DepotEspace`), l'app peut être ouverte ou non. Source : `src/outils/mcp/`, assemblé par `npm run mcp`.
+- **Mêmes outils que l'assistant (§12)**, avec les mêmes contrôles : `decrire_espace` en plus, sans `repondre`, `retenir`, `oublier` ni `creer_skill` (le client a sa propre réponse et sa propre mémoire). Une base synchronisée (§16) reste en lecture seule.
+- **Chaque appel d'écriture s'applique aussitôt**, sans aperçu : c'est le client qui demande l'accord avant chaque appel. Les outils de suppression sont marqués destructeurs. L'annulation de l'app (Ctrl+Z) ne couvre pas ces écritures.
+- L'espace est relu sur le disque avant chaque appel (changements faits par l'app ou la synchro), et les écritures sont sur le disque avant la réponse. Les appels passent un par un.
+- Aucun appel réseau : le serveur parle au client sur l'entrée et la sortie standard. Ce que le client lit de l'espace part chez le fournisseur de son modèle, comme avec l'assistant.
+
+### App de bureau [DÉCIDÉ, livrée le 07/10/2026 pour Windows]
+- Tauri 2, Windows en priorité. La même app web, dans une fenêtre native ; `src-tauri/` pour le code natif.
+- **Fichiers** : `AdaptateurBureau` (`src/adapters/tauri/`) appelle des commandes natives (`lister`, `lire`, `ecrire`, `renommer`, `supprimer`, `date_modification`) qui n'acceptent que des chemins sous la racine de l'espace, à la place de File System Access (absent de WebKit sur Mac). Le dossier se choisit par la fenêtre du système ; il est retenu dans les réglages de l'app et rouvert au lancement, sans permission à redonner.
+- **Surveillance** : chaque changement dans le dossier (MCP, synchro Jira, autre machine) relit l'espace aussitôt, sans passer par l'indicateur « Relu à » ; la relecture au retour sur la fenêtre reste.
+- Pas de service worker. Installeur Windows NSIS par utilisateur (sans droits administrateur), fabriqué par `.github/workflows/bureau.yml`.
+- Windows : installeur non signé au début (SmartScreen demande « Exécuter quand même »), Microsoft Store plus tard si besoin. Mac : signature et notarisation avec un compte Apple Developer.
+- Plugins installés depuis l'app : Jira d'abord (appel direct, sans CORS ni script au démarrage, §16 « Dans l'app de bureau »), puis le serveur MCP (« Connecter à Claude »).
+
+### Serveur MCP dans l'app de bureau [DÉCIDÉ, demandé par Alex le 09/10/2026]
+- Sur le bureau, **c'est l'app qui sert le MCP**, sans Node ni paquet à extraire. Module « Claude (MCP) » (§19), propre à cette machine, désactivé par défaut.
+- Le client lance `mdbase.exe --mcp` : ce mode n'ouvre pas de fenêtre, il relaie l'entrée et la sortie standard vers l'app ouverte. **App fermée, il l'ouvre** et attend qu'elle soit prête (45 s au plus) ; sinon, chaque appel répond une erreur qui dit quoi faire (ouvrir l'app, un espace, activer le module).
+- Liaison : l'app écoute sur `127.0.0.1` (port au hasard) et n'accepte que les requêtes qui portent un jeton tiré à chaque lancement. Port et jeton sont dans `mcp.json`, dans le dossier des réglages de l'utilisateur (lisible par lui seul hors Windows). Tant que le module n'est pas activé dans un espace ouvert, l'app répond « pas prête » sans rien exécuter.
+- Les appels s'exécutent dans la page, sur l'espace ouvert, par le même code que le serveur Node (`core/ia/mcp.ts`) : mêmes outils, mêmes contrôles, écritures aussitôt sur le disque et visibles dans l'app.
+- **Connexion depuis Modules** : « Connecter à Claude Desktop » ajoute `mdbase` aux `mcpServers` de sa configuration (installation classique et Microsoft Store), en gardant le reste du fichier et une copie de l'ancien (`claude_desktop_config.avant-mdbase.json`) ; Claude Desktop est à redémarrer. Claude Code : la commande `claude mcp add` à copier, chemin de l'app compris.
+- Le paquet `mdbase.mcpb` reste pour qui n'a pas l'app de bureau (Mac aujourd'hui).
+
+---
+
+## 18. Connaissance de l'assistant [DÉCIDÉ, validé par Alex le 07/10/2026 ; budget et rédaction guidée encore à faire]
+
+But : un assistant pertinent sans réexpliquer à chaque demande l'organisation, les workflows et le vocabulaire ; nourri des documents qui arrivent chaque semaine (présentations surtout) ; qui signale ce qui ne colle plus. Tout se gère depuis l'interface (panneau de l'assistant, page Inbox, fenêtre Modules §19) : rien n'apparaît dans les bases, et l'utilisateur n'a jamais à ouvrir ces fichiers (ils restent lisibles, dans `_assistant/`, synchronisés avec le dossier).
+
+### Deux couches
+- **Contexte** (`_assistant/contexte.md`) : ce qui bouge peu. Markdown libre, **envoyé en entier à chaque demande**. Sections conseillées, proposées à la création :
+  - *Organisation* : la hiérarchie des bases et ce que chaque niveau représente (ex. Projet → Version → Lot → Ticket, les tickets Jira attachés aux tickets) ;
+  - *Propagation* : ce qui découle d'un changement (un lot qui glisse décale la livraison de sa version ; une remarque sur un ticket remonte dans le suivi de sa version…) ;
+  - *Remarques* : pour chaque base, où et sous quelle forme noter une remarque dans le corps des pages (ex. section « Remarques », une entrée datée par ligne ; sur une version, « Points d'attention » et « Décisions ») ;
+  - *Vocabulaire, rituels, interlocuteurs*.
+  Première rédaction guidée [PROPOSÉ, pas encore faite : aujourd'hui, un modèle prérempli des sections conseillées] : l'assistant pose des questions (en s'appuyant sur les bases et relations existantes) et propose un texte, que l'utilisateur corrige. Ensuite, il ne change le contexte que par propositions, montrées dans l'aperçu (passage avant → après). Une jauge montre sa taille, avec un plafond indicatif (au-delà, un avertissement, pas un refus).
+- **Documents** (`_assistant/documents/`) : ce qui bouge chaque semaine. **Jamais envoyés d'office** : l'assistant y cherche avec deux outils de lecture, `chercher_documents` (mots, du plus récent au plus ancien, passages avec leur document et sa date ; index `minisearch` comme la recherche globale) et `lire_document`. Il cite la source et sa date dans ses réponses.
+
+La mémoire (§12) reste telle quelle : les petits faits et préférences appris en conversation. Le contexte, lui, est le texte de référence de l'utilisateur.
+
+### Fichier d'un document
+`_assistant/documents/<date>--<slug>.md` : le document converti en Markdown, avec un frontmatter (nouvelles clés) :
+```yaml
+---
+titre: Point hebdo projet A
+source: point-hebdo-A-S41.pptx   # nom du fichier d'origine (le fichier lui-même n'est pas copié)
+date: 2026-10-07                 # date de l'information ; à défaut, date de l'ajout
+ajoute: 2026-10-07T09:12
+lignes: [projets/k2x9m4pq, versions/v3a8c2de]   # lignes concernées, trouvées par l'assistant à l'ajout
+remplace_par: 2026-10-14--point-hebdo-projet-a  # absent tant qu'il est à jour
+---
+```
+Un document remplacé reste lisible (`lire_document`) mais n'est plus cherché par défaut.
+
+**Panneau Documents** [DÉCIDÉ, validé par Alex le 07/10/2026] : une entrée « Documents » dans la barre latérale (module Contexte IA, §19), sous « Inbox », avec le nombre de documents à jour. Elle ouvre un panneau à droite, comme l'inbox, avec deux onglets :
+- **Documents** : recherche (titre, fichier et texte, sans tenir compte des accents ; l'extrait trouvé s'affiche), regroupement par mois du plus récent au plus ancien, documents remplacés cachés sauf à cocher « Montrer les documents remplacés ». Un clic ouvre la fiche : date, fichier d'origine, date de rangement, lignes concernées (un clic ouvre la ligne dans sa base), document qui le remplace ou qu'il remplace (un clic l'ouvre), puis le texte rendu en Markdown. « Supprimer » après confirmation ; ceux qu'il remplaçait redeviennent à jour.
+- **Contexte** : l'édition du contexte, avec son compteur de taille. Un contexte neuf est prérempli des sections conseillées.
+
+### Conversion
+À l'ajout, une fois, dans l'app (navigateur comme bureau), sans Python ni service externe : PDF par pdf.js, Word par mammoth, PowerPoint en lisant le XML du `.pptx` (une section par diapositive, titre, texte des formes, tableaux en tableaux Markdown, graphiques en tableau de leurs valeurs, texte des SmartArt, notes de l'orateur). Bibliothèques chargées seulement à la première conversion. Limites, dites à l'ajout : un PDF scanné ne donne pas de texte ; les images et captures d'une présentation sont ignorées (signalées « image non lue »).
+
+### Inbox
+**Une page à part** [DÉCIDÉ, validé par Alex le 07/10/2026] : une entrée « Inbox » dans la barre latérale, sous « Toutes les tâches », avec le nombre d'éléments en attente. Elle ouvre un panneau à droite du contenu, comme celui de l'assistant (même place, même poignée ; un seul des deux ouvert à la fois), dédié à l'inbox. L'inbox sert aussi **sans l'assistant** : c'est d'abord un endroit où tout déposer.
+- **Déposer** : un champ (remarque brute, copier-coller ; `Ctrl+Entrée`), un bouton « Fichier », et tout le panneau comme zone de dépôt (PDF, Word, PowerPoint, texte).
+- **À traiter** : la liste des éléments en attente (`_assistant/inbox/`), du plus récent au plus ancien : icône (note ou fichier), titre, date de réception, début du texte (déplié au clic), question laissée par l'assistant s'il y en a une. Par ligne : « Envoyer à l'IA », « Marquer traité » (sans l'IA), « Supprimer ». En tête : « Tout envoyer à l'IA ».
+- **Envoyer à l'IA** (un élément ou tous) ouvre le panneau de l'assistant sur la demande ; le plan se relit et s'applique là, comme toute proposition (§12). L'assistant :
+  1. rattache chaque information aux lignes concernées, en suivant l'*Organisation* du contexte ;
+  2. propose un plan dans l'aperçu habituel : remarques datées ajoutées au corps des bonnes pages (outil `ajouter_remarque` : ajoute « - JJ/MM/AAAA : … » à la fin d'une section `## …`, créée si elle manque, sans réécrire le reste de la page ; disponible aussi hors inbox), champs à mettre à jour, ce qui en découle selon la *Propagation*, correction du contexte si l'organisation a changé ;
+  3. range le fichier en document (frontmatter rempli, `remplace_par` posé sur ceux qu'il remplace, avec confirmation) ;
+  4. liste à part les **incohérences**, jamais appliquées : présentation contre bases (date, statut, avancement), contre le statut des tickets Jira attachés, contre la présentation précédente du même projet (une date qui bouge sans explication), contre le contexte.
+  Une information qu'il ne sait pas rattacher reste à traiter, avec sa question. Une base Jira (§16) reste en lecture seule : une remarque sur un ticket Jira va sur la ligne de l'utilisateur qui l'attache.
+- **Traités** : un élément traité (plan appliqué, ou « Marquer traité ») n'est plus supprimé : il passe dans `_assistant/inbox/traites/`, avec ce qui en a été fait. Section repliée par défaut (« Traités (n) »), du plus récent au plus ancien ; « Vider l'historique » supprime ces fichiers après confirmation. Nouvelles clés du frontmatter d'un élément traité :
+  ```yaml
+  traite: 2026-10-07T09:20          # date du traitement
+  bilan:                             # ce qui a été fait, en phrases lisibles (aperçu du plan appliqué)
+    - Noter dans « Navi » (Projets), section Remarques
+    - Statut de « Tâche A » (Tâches) : En cours → Terminé
+    - "À vérifier : la livraison passe du 15/10 au 29/10 sans explication"
+  document: 2026-10-07--point-hebdo-navi-s41   # si le fichier a été rangé en document : son texte n'est pas recopié ici
+  ```
+  Un élément marqué traité à la main a `bilan: [Marqué traité]`.
+
+### Budget [PROPOSÉ, pas encore fait]
+- **Compteur** : chaque réponse du service donne les jetons consommés ; le panneau affiche le coût du mois (prix du modèle saisi ou prérempli). **Plafond mensuel** entièrement réglable par l'utilisateur : aucun par défaut (désactivé tant qu'il n'est pas saisi), montant et devise libres, prix par million de jetons modifiables pour tout modèle (préremplis seulement pour les services connus, jamais imposés). Une fois réglé : avertissement à 80 %, arrêt au plafond, levable pour le mois en cours. Gardé avec la clé, par machine : la vraie garantie reste la limite de dépense réglée dans la console du fournisseur, que l'écran de réglage recommande.
+- **Cache de prompt** : un connecteur Anthropic natif, à côté du connecteur générique, marque contexte, outils et description de l'espace comme cachables (relus à environ 10 % du prix pendant quelques minutes). Le connecteur compatible OpenAI reste pour les autres services.
+- Documents cherchés et non envoyés ; à l'ajout, seuls le nouveau document et les passages qu'il concerne partent.
+
+
+## 19. Modules [DÉCIDÉ, validé par Alex le 07/10/2026]
+
+Les fonctions qui ne servent pas à tout le monde s'activent une par une, dans une fenêtre **Modules** (bouton en bas de la barre latérale, au-dessus de « Changer de dossier »). Un interrupteur par module, avec une phrase qui dit ce qu'il fait, et son réglage quand il en a un :
+
+| Module | Ce qu'il montre | Par défaut |
+| --- | --- | --- |
+| Jira | « Nouvelle base Jira », bandeau de synchro, réglages de la base Jira (§16) | activé si l'espace contient déjà une base Jira |
+| Assistant IA | bouton et panneau de l'assistant, `Ctrl+J` ; réglage : la connexion (§12), avec l'avertissement d'activation | désactivé |
+| Inbox | entrée et page Inbox (§18) ; sans l'assistant, pas de bouton « Envoyer à l'IA » | désactivé |
+| Contexte IA | contexte et documents envoyés ou cherchés par l'assistant (§18) ; entrée et panneau Documents (documents rangés, édition du contexte). Demande l'assistant | désactivé |
+| Claude (MCP) | app de bureau seulement : l'app répond aux appels MCP de Claude Desktop ou Claude Code (§17) ; réglage : « Connecter à Claude Desktop » et la commande pour Claude Code | désactivé |
+
+- Désactiver un module **cache** ce qu'il montre ; aucun fichier n'est touché. Un espace qui contient une base Jira garde le module actif (règle du magasin, plus bas).
+- Les choix sont gardés **par machine** (dans le navigateur, comme la clé de l'assistant), pas dans le dossier : aucune nouvelle clé dans `_espace.yaml`.
+- Les modules suivants (intégrations tierces) s'ajoutent à la même fenêtre.
+
+### Magasin de modules [DÉCIDÉ, validé par Alex le 19/10/2026]
+But : un outil **très simple à l'installation**, où l'on ajoute ce qui sert quand on le voit. Le magasin est **interne** : tout le code est dans l'app, rien n'est téléchargé ni exécuté depuis l'extérieur (principe « aucun code n'est exécuté depuis les données », §1). Il remplace la fenêtre Modules, au même endroit.
+- **Socle**, toujours là : bases, vue tableau, pages (propriétés, corps, onglets relation, contenus liés), relations, rollups, formules, filtres et tris, recherche, annulation, import et export. De quoi créer une petite base simple sans rien voir d'autre.
+- **Catalogue** par catégories ; chaque module a un nom, une phrase, une image de ce qu'il montre, et « Ajouter » ou « Retirer » :
+  - Vues : Kanban, Collection, Calendrier, Timeline, Plan de charge (§21) ;
+  - Organisation : Tâches (§9), Dashboards (blocs de vues, analyse SQL, fiches, §10) ;
+  - Assistant : Assistant IA, Inbox, Contexte IA ;
+  - Intégrations : Jira, Claude (MCP).
+  Un module retiré disparaît des menus (« Nouvelle vue », « Ajouter un bloc », barre latérale) ; rien d'autre ne change. Quand des vues manquent au menu « Nouvelle vue », sa dernière entrée, « Plus de vues », ouvre le magasin.
+- **Ne jamais casser un espace** (règle de toute nouvelle version et de tout module) :
+  - ajouter ou retirer un module ne touche aucun fichier ;
+  - **un module dont l'espace se sert est toujours actif**, sans réglage : une vue de son type, un dashboard, la clé `taches`, un onglet Tâches, une base Jira… L'interrupteur est alors grisé et dit pourquoi (« utilisé par 3 vues »). Une version qui fait passer une fonction du socle à un module, ou qui en ajoute un, ne cache donc jamais ce qu'un espace contient ; on n'en perd que les menus pour créer du neuf, jusqu'à « Ajouter » ;
+  - un modèle (plus bas) n'écrit que des fichiers neufs : jamais dans une base, une vue ou un dashboard existants ;
+  - une version de l'app lit toujours les fichiers écrits par les précédentes.
+- **Gardé par machine**, comme aujourd'hui (§19, plus haut). Comme « utilisé par l'espace » se déduit des fichiers, un collègue qui ouvre le même dossier voit d'office tout ce que l'espace contient. Activer un module pour toute une équipe relève de la collaboration [PLUS TARD], qui ne doit pas être rendue impossible : l'activation par espace s'ajoutera dans `_espace.yaml` sans changer cette règle.
+- **Modèles**, dans la même fenêtre : un ensemble prêt à l'emploi de bases, vues et dashboards déjà reliés, avec quelques lignes d'exemple qu'on peut effacer. « Utiliser ce modèle » active les modules dont il a besoin, puis crée ses bases dans un nouveau groupe nommé comme lui. Un identifiant de base déjà pris est dédoublonné, et ses références (cibles de relations, vues, dashboards) suivent. Les modèles sont des dossiers de fichiers livrés avec l'app (`modeles/<id>/`, avec un `modele.yaml` : nom, description, modules requis), vérifiés par les tests comme la démo. Premier modèle : « Planification de charge » (§21).
+
+
+---
+
+## 21. Plan de charge [DÉCIDÉ, validé par Alex le 19/10/2026]
+
+But : planifier la charge d'une équipe partagée entre plusieurs projets (une dizaine à une vingtaine de personnes), sans Excel : chaque projet a ses échéances, les ressources doivent tenir entre les projets, avec les absences et les rôles. Module « Plan de charge » (§19, magasin), désactivé par défaut. Modèle général, pas propre à un métier : ressources, projets, échéances.
+
+### Données (fournies par le modèle « Planification de charge », réglables sur n'importe quel schéma)
+- **Ressources** : nom, rôle (`select`), capacité en jours par semaine (`number`, 5 par défaut ; moins pour un temps partiel).
+- **Projets** : nom, début, échéance (une sortie, une livraison), statut. Un projet découpé en étapes datées se fait par une base Échéances reliée, au choix.
+- **Besoins** : projet, rôle, jours (charge totale), à faire avant (date, l'échéance du projet par défaut), et facultativement **à partir de** (date) ou une **phase** (relation) : la fenêtre où ce travail peut se faire. Le développement d'une version se fait avant le début de sa recette : deux besoins, deux fenêtres.
+- **Phases** (facultatives, choix du 20/10/2026 : les phases qu'Alex a déjà pour ses timelines) : début, fin, et un rôle facultatif. Un besoin relié à une phase prend sa fenêtre (ses propres dates l'emportent) et, s'il n'a pas de rôle, le rôle de la phase. Décaler une phase décale le remplissage.
+- **Moratoires** (facultatifs) : nom, début, fin, et une case **fermé**. Fermé : personne ne travaille, chaque jour compte comme un jour férié pour tous (capacité et charge à 0). Sinon, c'est un gel des livraisons : on travaille, mais aucune fin de phase, de remplissage ni de version ne doit tomber dedans.
+- **Affectations** : ressource, projet, début, fin, et soit des jours par semaine, soit des jours au total (colonne facultative `total`, répartie sur les jours ouvrés de la période) ; une version du projet, facultative ; un **détail** facultatif (colonne `text`) : les jours qui ne suivent pas la règle, une ligne par jour (`2026-10-19: 0.5`) ; un **scénario** facultatif (colonne `select`) : vide pour le plan réel, sinon le nom d'un essai ; **remplace** facultatif (relation de la base vers elle-même) : l'affectation réelle que cette affectation de scénario remplace.
+- **Versions** (facultatives) : nom, projet, date de sortie. Une affectation peut viser une version de son projet.
+- **Absences** : ressource, début, fin, type.
+
+### Calcul (cœur, sans interface)
+- Maille : le **jour** ouvré, la **semaine** (lundi à vendredi, par défaut) ou le **mois**, en jours. Tout se calcule jour par jour puis s'additionne : la capacité d'un jour ouvré vaut capacité / 5 (0 un jour d'absence ou férié).
+- **Capacité nette** d'une ressource une semaine : capacité × jours ouvrés de la semaine moins jours d'absence et jours fériés (France, calculés), divisé par 5.
+- **Charge** d'une ressource une semaine : somme, pour chaque affectation, de ses jours par semaine × ses jours ouvrés dans la semaine (entre début et fin) / 5. Un jour férié réduit donc la charge comme la capacité : un plein temps reste à plein. Une absence ne réduit pas la charge : elle réduit la capacité, et le conflit se voit.
+- **Détail** : un jour ouvré listé dans le détail d'une affectation, entre son début et sa fin, pèse la valeur indiquée à la place de sa charge habituelle (0 l'efface ce jour-là). Les autres jours gardent la leur, un total n'est pas redistribué. Une ligne illisible, hors de la plage ou sur un jour non ouvré est ignorée et conservée telle quelle. C'est la gestion fine : une correction de jour ne crée aucun fichier, elle s'ajoute au fichier de l'affectation (choix du 20/10/2026, à la manière de MS Project, plutôt qu'une base d'ajustements qui aurait compté des centaines de lignes).
+- **Scénarios** : une affectation avec un scénario ne compte que lorsque ce scénario est affiché, en plus du plan réel ; plusieurs essais coexistent (« Option A », « Option B »). Les options de la colonne sont la liste des scénarios. Une affectation de scénario qui en **remplace** une réelle la masque quand le scénario est affiché : c'est ainsi qu'un essai modifie le plan réel sans le toucher (une copie à 0 jour retire quelqu'un du projet dans l'essai).
+- **Remplir** : placer des jours d'un projet (et d'une version), **une ligne par rôle**, chacune sur sa période et par les seules ressources de son rôle, dans la capacité libre de la situation affichée ; les lignes se placent l'une après l'autre (la capacité prise par la première n'est plus libre pour la suivante). Les lignes se pré-remplissent depuis les besoins du projet : ce qui manque encore, dans la fenêtre de chaque besoin. La fin d'une ligne qui tombe dans un gel des livraisons est ramenée à la veille du gel. Deux modes : **au plus tôt** (défaut : chaque jour ouvré, de la première ressource la plus disponible sur la période à la suivante, jusqu'à épuisement) et **lissé** (chaque jour vise le reste à placer divisé par les jours restants). Le résultat est une affectation par ressource et par ligne (jours par semaine les plus fréquents, et le détail des jours qui s'en écartent) ou, sans colonne de détail, une affectation par suite de jours égaux ; et pour chaque ligne, ce qui est placé, ce qui manque et le dernier jour travaillé (« fini le 27/11 »). Rien n'est écrit avant validation, et les affectations créées le sont dans un scénario.
+- **Couverture d'un besoin** : jours affectés au projet par des ressources de ce rôle dans sa fenêtre (de sa date de début, s'il en a une, jusqu'à sa date) (chaque jour ouvré d'une affectation compte ses jours par semaine / 5, ou son total / ses jours ouvrés), comparés aux jours demandés.
+- **Charge par projet** d'un ensemble de ressources (toutes, ou un rôle) sur chaque période, et par version : la donnée du graphique.
+
+### Vue « Plan de charge » (`type: charge`, vue de la base des ressources)
+- **Par ressource** : une grille ressources × semaines, groupée par rôle. Chaque case montre la charge sur la capacité nette, colorée : libre (moins de 80 %), pleine (jusqu'à 100 %), surchargée (au-delà, en rouge) ; une semaine d'absence complète est hachurée. Une ligne se déplie par projet, pour voir d'où vient la charge. Une ligne par rôle, en tête de groupe, additionne ses ressources. « Grouper par » (barre de la vue) range plutôt les lignes par projet ou par version : sous chacun, les ressources qui y travaillent et leur part, la couleur restant celle de leur charge totale (une surcharge ailleurs se voit) ; glisser dans un groupe de projet crée l'affectation sur ce projet (et cette version) sans le demander. Au-dessus des colonnes, un bandeau donne le mois et l'année (l'année seule à la maille mois).
+- **Besoins** : pour chaque projet (ou échéance), le besoin de chaque rôle comparé à ce qui est affecté avant sa date : « couvert » ou « il manque 12 jours de rôle X », et les semaines où ses ressources sont surchargées ailleurs.
+- **Graphique** : une barre par période (selon la maille), empilée par projet, ou par version (nuances de la couleur de son projet) ; la capacité de l'équipe en trait par-dessus ; filtre par rôle ; au survol, le projet et ses jours. Couleur d'un projet : celle de l'option de `couleur_par` (colonne choix des projets), sinon une couleur de la palette par projet, stable.
+- **Maille** : Jour, Semaine ou Mois, à côté des modes ; en jour, une colonne par jour ouvré (fériés et absences hachurés) ; les versions datées se marquent sur l'en-tête de leur période.
+- **Modifier** : cliquer une case liste les affectations qui la composent (projet, jours par semaine, dates), modifiables sur place. Quand une affectation déborde de la case, la valeur saisie vaut par défaut pour « ce jour » (cette semaine, ce mois) seulement : avec une colonne de détail, elle s'y écrit (répartie également sur les jours ouvrés de la case), une valeur égale à la charge habituelle retire la ligne, et « Revenir à l'affectation » efface le détail de la case ; une case corrigée porte un repère. Sans colonne de détail, l'affectation est coupée en morceaux avant, pendant et après (le morceau du milieu au total si la base a une colonne de total), en une seule étape d'annulation. « Toute l'affectation » modifie ses jours par semaine ou son total. Glisser sur plusieurs semaines d'une ligne crée une affectation (ressource et dates remplies, jours par semaine = capacité restante), dont on choisit le projet. Rien ne se modifie en consultation.
+- **Scénario** (barre de la vue, avec une colonne de scénario) : « Plan réel » ou « Plan réel + Option A »…, et « Nouveau scénario » qui demande un nom (proposé : la première « Option X » libre), ajoute l'option et affiche le scénario, vide ; les affectations du scénario affiché se voient en pointillé dans la grille et atténuées dans le graphique. Quand un scénario est affiché, modifier une affectation réelle (une case, toute l'affectation) crée sa copie dans le scénario, qui la remplace et reçoit la modification ; l'originale ne change pas. Glisser sur la grille crée dans le scénario affiché. « Confirmer » recopie chaque copie sur l'affectation qu'elle remplace (même fichier, même nom) puis la supprime, vide le scénario des autres (elles deviennent réelles) et retire l'option ; « Abandonner » les supprime et retire l'option, en une étape d'annulation pour les lignes.
+- **Moratoires** : une bande au-dessus des colonnes (hachurée si fermé), avec son nom au survol ; une version dont la date tombe dans un gel est signalée sur son jalon.
+- **Remplir** (bouton de la barre) : projet, version, lignes par rôle (rôle, jours, du, au ; pré-remplies depuis les besoins), mode (« Au plus tôt » affiché par défaut, « Lissé ») et scénario (existant ou nouveau). L'aperçu se voit aussitôt dans la grille, en pointillé, avec ce qui est placé et ce qui manque ; « Créer » écrit les affectations dans le scénario.
+- **Aide** (« ? » au bout de la barre) : le mode d'emploi en quelques blocs (lire la grille, affecter, ajuster un jour, scénarios, Remplir, besoins, moratoires, réglages).
+- **Réglages** (Options) : bases et colonnes des affectations, de la capacité et des absences ; colonne du rôle ; regroupement des lignes ; maille ; jours fériés (France ou aucun) ; période affichée.
+
+```yaml
+type: charge
+capacite: capacite                 # colonne number de la base des ressources (jours par semaine)
+groupe: role
+affectations: { base: affectations, ressource: ressource, projet: projet, debut: debut, fin: fin, jours: jours_semaine, total: total_jours, version: version, detail: detail, scenario: scenario, remplace: remplace }  # total, version, detail, scenario et remplace facultatifs
+absences: { base: absences, ressource: ressource, debut: debut, fin: fin }       # optionnel
+maille: semaine                    # jour, semaine ou mois
+periodes: 12                       # nombre de colonnes affichées (20 jours, 12 semaines, 6 mois par défaut)
+couleur_par: statut                # facultatif : colonne choix des projets qui colore le graphique
+regrouper: projet                  # facultatif : lignes par projet ou par version (par rôle sans la clé)
+feries: france                     # ou aucun
+besoins: { base: besoins, projet: projet, role: role, jours: jours, avant: avant, apres: a_partir_de, phase: phase }  # apres et phase facultatifs
+phases: { base: phases, debut: debut, fin: fin, role: role }          # facultatif ; role facultatif
+moratoires: { base: moratoires, debut: debut, fin: fin, ferme: ferme } # facultatif ; ferme (checkbox) facultatif : sans, un gel des livraisons
+```
+
+- Les deux niveaux ne sont pas figés : « projet » est n'importe quelle relation des affectations (programme, client…) et « version » une relation vers une base liée à la première (étape, lot…). L'interface les nomme d'après leur base (« Par programme », « Par étape »).
+- Assistant IA et MCP : un outil `calculer_charge` (lecture) rend la charge, la capacité et la couverture sur une période (avec un scénario, facultatif), pour répondre à « qui est disponible en mars ? » ; un outil `proposer_remplissage` (lecture) rend ce que « Remplir » placerait, avec les valeurs exactes des affectations à créer ; les affectations se créent avec les outils des lignes (règle §17 : outil commun aux deux).
+
+## 20. Rapports [PLUS TARD]
+
+Proposés le 09/10/2026 comme des fichiers `_rapports/<id>.md` à part (Markdown, blocs SQL et graphiques). Le 12/10/2026, Alex choisit de commencer dans les dashboards : voir §10 « Analyse ». Les séparer reste possible plus tard, avec le même moteur et les mêmes visuels.
+
+---
+
+## 15. Questions ouvertes
+
+- Nom du produit.
+- Cible au-delà de l'usage personnel d'Alex (positionnement exact, distribution).
+- Cardinalité configurable des relations : UX de conversion d'une relation existante.
+- Stratégie d'import / export.

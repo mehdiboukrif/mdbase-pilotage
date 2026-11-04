@@ -1,0 +1,22 @@
+version: 1
+id: affectations
+nom: Affectations
+champ_titre: nom
+colonnes:
+  - { cle: nom, nom: Affectation, type: text }
+  - { cle: ressource, nom: Ressource, type: relation, cible: ressources, proprietaire: true, inverse: affectations }
+  - { cle: projet, nom: Projet, type: relation, cible: projets, proprietaire: true, inverse: affectations }
+  - { cle: version, nom: Version, type: relation, cible: versions, proprietaire: true, inverse: affectations }
+  - { cle: debut, nom: Début, type: date }
+  - { cle: fin, nom: Fin, type: date }
+  - { cle: jours, nom: Jours par semaine, type: number }
+  - { cle: total, nom: Jours au total, type: number }
+  - { cle: detail, nom: Détail jour par jour, type: text }
+  - cle: scenario
+    nom: Scénario
+    type: select
+    options:
+      - { label: Option A, couleur: orange }
+  - { cle: remplace, nom: Remplace, type: relation, cible: affectations, proprietaire: true, inverse: remplacee_par }
+  - { cle: remplacee_par, nom: Remplacée par, type: relation, cible: affectations, proprietaire: false, inverse: remplace }
+vues: [ tableau ]

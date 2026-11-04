@@ -1,0 +1,124 @@
+import type { LigneChargee } from './base'
+import type { Calculs } from './calcul'
+import { correspond, SANS_VALEUR, type Contexte } from './filtres'
+import { colonne, type Schema } from './schema'
+import { jourDe } from './temps'
+import { PROFONDEUR_MAX, type Filtre, type Niveau } from './vue'
+
+// Timeline en arbre (spec §7) : sous chaque ligne, les lignes liées par les
+// relations cochées, niveau par niveau (un projet, ses versions, leurs jalons).
+
+/** Un filtre en cours de saisie (valeur pas encore tapée) ne filtre rien. */
+const complet = (f: Filtre) => SANS_VALEUR.includes(f.operateur) || (f.valeur !== undefined && f.valeur !== '' && !(Array.isArray(f.valeur) && f.valeur.length === 0))
+
+/** Ce qu'il faut de l'espace pour descendre les relations. */
+export type SourceArbre = {
+  schemas: ReadonlyMap<string, Schema>
+  lignes: ReadonlyMap<string, readonly LigneChargee[]>
+  calculs: Calculs
+}
+
+/**
+ * Une ligne dépliée. `cle` est le chemin depuis la racine : une ligne liée à
+ * deux parents apparaît sous chacun, avec deux clés différentes.
+ */
+export type Noeud = {
+  cle: string
+  base: string
+  ligne: LigneChargee
+  niveau: Niveau
+  /** 1 pour les enfants directs d'une ligne de la vue. */
+  profondeur: number
+  enfants: Noeud[]
+}
+
+/** Ligne avec ses colonnes calculées : relations côté miroir, rollups, formules (pour lire les liens et filtrer). */
+export function avecCalculs(src: SourceArbre, base: string, ligne: LigneChargee): LigneChargee {
+  const c = src.calculs.get(base)?.get(ligne.id)
+  return c ? { ...ligne, cellules: { ...ligne.cellules, ...c } } : ligne
+}
+
+/**
+ * Enfants d'une ligne (déjà munie de ses calculs) pour les niveaux donnés :
+ * dans l'ordre des niveaux, puis par date de début (sans date à la fin). Une
+ * ligne déjà présente sur le chemin n'est pas redescendue (boucle de relations).
+ */
+export function enfantsDe(
+  src: SourceArbre,
+  base: string,
+  ligne: LigneChargee,
+  niveaux: readonly Niveau[],
+  ctx: Contexte,
+  cleParent: string,
+  profondeur = 1,
+): Noeud[] {
+  if (profondeur > PROFONDEUR_MAX) return []
+  const schema = src.schemas.get(base)
+  if (!schema) return []
+  return niveaux.flatMap((niveau) => {
+    const rel = colonne(schema, niveau.relation)
+    if (rel?.type !== 'relation') return []
+    const schemaCible = src.schemas.get(rel.cible)
+    if (!schemaCible) return []
+    const cellule = ligne.cellules[rel.cle]
+    const ids = new Set(cellule?.etat === 'ok' && Array.isArray(cellule.valeur) ? cellule.valeur : [])
+    const filtres = niveau.filtres.filter(complet)
+    const debut = niveau.champDebut ? colonne(schemaCible, niveau.champDebut) : undefined
+    const date = (l: LigneChargee) => {
+      const c = debut && l.cellules[debut.cle]
+      return (c?.etat === 'ok' && jourDe(c.valeur)) || '\uffff' // sans date : à la fin
+    }
+    return (src.lignes.get(rel.cible) ?? [])
+      .filter((l) => ids.has(l.id))
+      .map((l) => avecCalculs(src, rel.cible, l))
+      .filter((l) => filtres.every((f) => correspond(l, schemaCible, f, ctx)))
+      .sort((a, b) => date(a).localeCompare(date(b)))
+      .flatMap((l): Noeud[] => {
+        const cle = `${cleParent}/${rel.cible}:${l.id}`
+        if (cleParent.split('/').includes(`${rel.cible}:${l.id}`)) return []
+        // Un niveau « sur la ligne » se dessine sur la rangée de son parent : il ne se déplie pas plus bas.
+        const enfants = niveau.surLaLigne ? [] : enfantsDe(src, rel.cible, l, niveau.deplier, ctx, cle, profondeur + 1)
+        return [{ cle, base: rel.cible, ligne: l, niveau, profondeur, enfants }]
+      })
+  })
+}
+
+/** Tous les descendants d'une liste de nœuds, en profondeur d'abord. */
+export function descendants(noeuds: readonly Noeud[]): Noeud[] {
+  return noeuds.flatMap((n) => [n, ...descendants(n.enfants)])
+}
+
+/**
+ * Lignes de la vue à ne pas répéter en tête (spec §7, auto-relation) : celles
+ * dépliées sous une autre ligne de la vue par une chaîne de relations de la
+ * base vers elle-même (sous-tâches). Une boucle sans entrée (D sous E, E sous
+ * D) garde sa première ligne en tête, pour qu'aucune ne disparaisse.
+ * `arbres` : les enfants dépliés de chaque ligne de la vue, dans l'ordre de la vue.
+ */
+export function sousElements(schema: Schema, arbres: readonly (readonly [string, readonly Noeud[]])[]): Set<string> {
+  const atteintes = new Map<string, Set<string>>()
+  const descendre = (noeuds: readonly Noeud[], vues: Set<string>) => {
+    for (const n of noeuds) {
+      const rel = colonne(schema, n.niveau.relation)
+      if (n.base !== schema.id || rel?.type !== 'relation' || rel.cible !== schema.id) continue
+      vues.add(n.ligne.id)
+      descendre(n.enfants, vues)
+    }
+  }
+  for (const [id, noeuds] of arbres) {
+    const vues = new Set<string>()
+    descendre(noeuds, vues)
+    vues.delete(id)
+    atteintes.set(id, vues)
+  }
+  const masquees = new Set([...atteintes.values()].flatMap((v) => [...v]))
+  // Ce que les lignes gardées en tête déplient vraiment ; une ligne masquée que rien de gardé n'atteint revient.
+  const couvertes = new Set<string>()
+  for (const [id] of arbres) if (!masquees.has(id)) for (const x of atteintes.get(id)!) couvertes.add(x)
+  for (const [id] of arbres) {
+    if (!masquees.has(id) || couvertes.has(id)) continue
+    masquees.delete(id)
+    for (const x of atteintes.get(id)!) couvertes.add(x)
+  }
+  return masquees
+}

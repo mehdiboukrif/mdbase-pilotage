@@ -1,0 +1,609 @@
+import { useRef, useState, type DragEvent, type ReactNode } from 'react'
+import type { DepotEspace, EtatEspace, PorteeSuppressionBase } from '../core/depot-espace'
+import { useLancer } from './actions'
+import { AlerteCopies } from './Conflits'
+import type { Selection } from './App'
+import { Flottant } from './flottant'
+import { BookOpen, ChevronRight, Ellipsis, Inbox, ListChecks, Plus, RefreshCw, RotateCw, Search, Sparkles, Store, Table2, Upload } from 'lucide-react'
+import { FenetreImport } from './Echange'
+import { Icone } from './icones'
+import { FenetreBaseJira } from './Jira'
+import { BasculeBarre, useConsultation } from './mode'
+import type { ModulesActifs } from './modules'
+
+type Props = {
+  espace: DepotEspace
+  etat: EtatEspace
+  nomEspace: string
+  selection: Selection | null
+  choisir: (id: string) => void
+  choisirDashboard: (id: string) => void
+  changerDossier: () => void
+  /** Ouvre ou ferme le panneau de l'assistant IA (ou son activation s'il est désactivé). */
+  assistant: () => void
+  /** Demande en cours ou proposition à relire, quand le panneau est fermé. */
+  indicateurIA?: ReactNode
+  /** Ouvre la recherche globale. */
+  chercher: () => void
+  /** Affiche la page « Toutes les tâches ». */
+  toutesLesTaches: () => void
+  /** Relit le dossier (changements faits ailleurs), et l'état de la dernière relecture. */
+  relire: () => void
+  relu: { enCours: boolean; a: Date | null }
+  /** Réduit la barre latérale (le bouton de sa tête). */
+  reduire: () => void
+  /** Modules activés (spec §19) : ce qu'ils montrent dans la barre. */
+  assistantActif: boolean
+  modules: Pick<ModulesActifs, 'jira' | 'inbox' | 'contexte' | 'taches' | 'dashboards'>
+  /** Entrée Inbox : éléments en attente, panneau ouvert, ouvrir ou fermer. */
+  inbox: { compte: number; ouverte: boolean; basculer: () => void }
+  ouvrirModules: () => void
+  /** Entrée Documents (module Contexte IA) : documents à jour, panneau ouvert, ouvrir ou fermer. */
+  documents: { compte: number; ouverte: boolean; basculer: () => void }
+}
+
+/** Sections repliées de la barre latérale, par espace : préférence de cette machine (localStorage), jamais dans le dossier. */
+function useReplis(nomEspace: string) {
+  const cle = `mdbase:replis:${nomEspace}`
+  const [replis, setReplis] = useState<ReadonlySet<string>>(() => {
+    try {
+      const brut = JSON.parse(localStorage.getItem(cle) ?? '[]') as unknown
+      return new Set(Array.isArray(brut) ? brut.filter((x): x is string => typeof x === 'string') : [])
+    } catch {
+      return new Set()
+    }
+  })
+  const basculer = (section: string) =>
+    setReplis((avant) => {
+      const suivant = new Set(avant)
+      if (!suivant.delete(section)) suivant.add(section)
+      try {
+        localStorage.setItem(cle, JSON.stringify([...suivant]))
+      } catch {
+        // Stockage indisponible : le repli vaut pour cette visite.
+      }
+      return suivant
+    })
+  return { replis, basculer }
+}
+
+/** Nom d'une section qui la replie ou la déplie au clic ; repliée, le nombre d'entrées cachées. */
+function BasculeSection(p: { nom: string; replie: boolean; basculer: () => void; caches: number; renommer?: () => void; discret?: boolean }) {
+  return (
+    <button
+      className={`bascule-section ${p.discret ? 'discret' : ''}`}
+      aria-expanded={!p.replie}
+      title={p.replie ? 'Déplier' : 'Replier'}
+      // Un double-clic renomme : seul le premier clic replie.
+      onClick={(e) => e.detail <= 1 && p.basculer()}
+      onDoubleClick={p.renommer}
+    >
+      <Icone de={ChevronRight} taille={12} className="chevron-section" />
+      <span>{p.nom}</span>
+      {p.replie && p.caches > 0 && <span className="compte-section">{p.caches}</span>}
+    </button>
+  )
+}
+
+/** Barre latérale (spec §2) : groupes plats de bases, glisser-déposer entre groupes. */
+export function BarreLaterale({ espace, etat, nomEspace, selection, choisir, choisirDashboard, changerDossier, chercher, toutesLesTaches, assistant, indicateurIA, relire, relu, assistantActif, modules, inbox, ouvrirModules, documents, reduire }: Props) {
+  const lancer = useLancer()
+  const [creation, setCreation] = useState<'base' | 'groupe' | 'dashboard' | null>(null)
+  const choisie = selection?.type === 'base' ? selection.id : null
+  const [cible, setCible] = useState<string | null>(null)
+  const [importCsv, setImport] = useState(false)
+  const [jira, setJira] = useState(false)
+  // Consultation : on navigue, on cherche, rien ne se crée ni ne se range.
+  const lecture = useConsultation()
+  const { replis, basculer } = useReplis(nomEspace)
+
+  const nomBase = (id: string) => {
+    const c = etat.bases.get(id)?.chargement
+    return c?.ok ? c.base.schema.nom : id
+  }
+
+  /** Zone de dépôt : un groupe (null = hors groupe), à une position donnée. */
+  const deposable = (cleCible: string, groupe: string | null, index?: number) => ({
+    onDragOver: (e: DragEvent) => {
+      if (lecture || !e.dataTransfer.types.includes('text/base')) return
+      e.preventDefault()
+      e.stopPropagation()
+      setCible(cleCible)
+    },
+    onDragLeave: () => setCible(null),
+    onDrop: (e: DragEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      setCible(null)
+      const base = e.dataTransfer.getData('text/base')
+      if (base) void lancer(espace.placerBase(base, groupe, index))
+    },
+  })
+
+  /** Zone de dépôt d'un dashboard : sa place dans la liste (absente = à la fin). */
+  const deposableDashboard = (cleCible: string, index?: number) => ({
+    onDragOver: (e: DragEvent) => {
+      if (lecture || !e.dataTransfer.types.includes('text/dashboard')) return
+      e.preventDefault()
+      e.stopPropagation()
+      setCible(cleCible)
+    },
+    onDragLeave: () => setCible(null),
+    onDrop: (e: DragEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      setCible(null)
+      const id = e.dataTransfer.getData('text/dashboard')
+      if (id) void lancer(espace.deplacerDashboard(id, index ?? etat.dashboards.length))
+    },
+  })
+
+  // Une section repliée garde l'entrée ouverte, pour qu'on voie toujours où l'on est.
+  const entrees = (bases: string[], groupe: string | null, replie = false) =>
+    bases.map((id, index) => (replie && id !== choisie ? null : (
+      <EntreeBase
+        key={id}
+        nom={nomBase(id)}
+        active={id === choisie}
+        cible={cible === `base:${id}`}
+        choisir={() => choisir(id)}
+        renommer={(nom) => void lancer(espace.renommerBase(id, nom))}
+        dupliquer={async () => {
+          const copie = await lancer(espace.dupliquerBase(id))
+          if (copie) choisir(copie)
+        }}
+        portee={() => espace.porteeSuppressionBase(id)}
+        supprimer={() => {
+          const autre = [...etat.groupes.flatMap((g) => g.bases), ...etat.horsGroupe].find((x) => x !== id)
+          void lancer(espace.supprimerBase(id)).then(() => !espace.etat().bases.has(id) && id === choisie && autre && choisir(autre))
+        }}
+        glisser={(e) => e.dataTransfer.setData('text/base', id)}
+        {...deposable(`base:${id}`, groupe, index)}
+      />
+    )))
+
+  return (
+    <nav className="barre-laterale">
+      <div className="tete-barre">
+        <div className="nom-espace">{nomEspace}</div>
+        <BasculeBarre reduite={false} basculer={reduire} />
+      </div>
+      <button className="discret bouton-recherche" onClick={chercher}>
+        <Icone de={Search} />
+        Rechercher
+        <kbd className="discret">{/Mac/.test(navigator.platform) ? '⌘K' : 'Ctrl+K'}</kbd>
+      </button>
+      {!lecture && assistantActif && (
+        <button className="discret bouton-recherche" onClick={assistant}>
+          <Icone de={Sparkles} />
+          Assistant IA
+          {indicateurIA}
+          <kbd className="discret">{/Mac/.test(navigator.platform) ? '⌘J' : 'Ctrl+J'}</kbd>
+        </button>
+      )}
+      {modules.taches && (
+        <button className={`entree-taches ${selection?.type === 'taches' ? 'active' : ''}`} onClick={toutesLesTaches} aria-current={selection?.type === 'taches' ? 'page' : undefined}>
+          <Icone de={ListChecks} />
+          Toutes les tâches
+        </button>
+      )}
+      {!lecture && modules.inbox && (
+        <button className={`entree-taches ${inbox.ouverte ? 'active' : ''}`} onClick={inbox.basculer} aria-expanded={inbox.ouverte}>
+          <Icone de={Inbox} />
+          Inbox
+          {inbox.compte > 0 && <span className="compte-onglet">{inbox.compte}</span>}
+        </button>
+      )}
+      {!lecture && modules.contexte && assistantActif && (
+        <button className={`entree-taches ${documents.ouverte ? 'active' : ''}`} onClick={documents.basculer} aria-expanded={documents.ouverte}>
+          <Icone de={BookOpen} />
+          Documents
+          {documents.compte > 0 && <span className="compte-onglet">{documents.compte}</span>}
+        </button>
+      )}
+
+      {modules.dashboards && (
+      <section className={`groupe dashboards ${cible === 'dashboards' ? 'cible' : ''}`} {...deposableDashboard('dashboards')}>
+        <div className="titre-groupe">
+          <BasculeSection nom="Dashboards" replie={replis.has('dashboards')} basculer={() => basculer('dashboards')} caches={etat.dashboards.filter((d) => !(selection?.type === 'dashboard' && selection.id === d.id)).length} />
+          {!lecture && (
+            <button className="discret menu-groupe" onClick={() => setCreation('dashboard')} aria-label="Nouveau dashboard" title="Nouveau dashboard">
+              <Icone de={Plus} />
+            </button>
+          )}
+        </div>
+        {etat.dashboards.map((d, index) => (replis.has('dashboards') && !(selection?.type === 'dashboard' && selection.id === d.id) ? null : (
+          <EntreeDashboard
+            key={d.id}
+            nom={d.dashboard?.nom ?? d.id}
+            active={selection?.type === 'dashboard' && selection.id === d.id}
+            cible={cible === `dashboard:${d.id}`}
+            choisir={() => choisirDashboard(d.id)}
+            renommer={(nom) => void lancer(espace.modifierDashboard(d.id, { type: 'renommer', nom }))}
+            dupliquer={async () => {
+              const copie = await lancer(espace.dupliquerDashboard(d.id))
+              if (copie) choisirDashboard(copie)
+            }}
+            supprimer={() => void lancer(espace.supprimerDashboard(d.id))}
+            glisser={(e) => e.dataTransfer.setData('text/dashboard', d.id)}
+            {...deposableDashboard(`dashboard:${d.id}`, index)}
+          />
+        )))}
+        {creation === 'dashboard' && (
+          <ChampEnLigne
+            placeholder="Nom du dashboard"
+            valider={async (nom) => {
+              setCreation(null)
+              const id = await lancer(espace.creerDashboard(nom))
+              if (id) choisirDashboard(id)
+            }}
+            annuler={() => setCreation(null)}
+          />
+        )}
+      </section>
+      )}
+
+      {etat.groupes.map((g) => (
+        <section key={g.nom} className={`groupe ${cible === `groupe:${g.nom}` ? 'cible' : ''}`} {...deposable(`groupe:${g.nom}`, g.nom)}>
+          <EnteteGroupe
+            nom={g.nom}
+            replie={replis.has(`groupe:${g.nom}`)}
+            basculer={() => basculer(`groupe:${g.nom}`)}
+            caches={g.bases.filter((id) => id !== choisie).length}
+            renommer={(nouveau) => void lancer(espace.renommerGroupe(g.nom, nouveau))}
+            supprimer={() => void lancer(espace.supprimerGroupe(g.nom))}
+          />
+          {entrees(g.bases, g.nom, replis.has(`groupe:${g.nom}`))}
+          {g.bases.length === 0 && !lecture && !replis.has(`groupe:${g.nom}`) && <div className="vide">Glisse une base ici</div>}
+        </section>
+      ))}
+
+      <section className={`groupe ${cible === 'hors' ? 'cible' : ''}`} {...deposable('hors', null)}>
+        {etat.groupes.length > 0 && !(lecture && etat.horsGroupe.length === 0) && (
+          <div className="titre-groupe">
+            <BasculeSection nom="Hors groupe" discret replie={replis.has('hors')} basculer={() => basculer('hors')} caches={etat.horsGroupe.filter((id) => id !== choisie).length} />
+          </div>
+        )}
+        {entrees(etat.horsGroupe, null, etat.groupes.length > 0 && replis.has('hors'))}
+      </section>
+
+      {creation && creation !== 'dashboard' ? (
+        <ChampEnLigne
+          placeholder={creation === 'base' ? 'Nom de la base' : 'Nom du groupe'}
+          valider={async (nom) => {
+            setCreation(null)
+            if (creation === 'groupe') return void lancer(espace.ajouterGroupe(nom))
+            const id = await lancer(espace.creerBase(nom))
+            if (id) choisir(id)
+          }}
+          annuler={() => setCreation(null)}
+        />
+      ) : (
+        !lecture && (
+          <>
+            <button className="discret ajout-barre" onClick={() => setCreation('base')}>
+              <Icone de={Plus} /> Nouvelle base
+            </button>
+            <button className="discret ajout-barre" onClick={() => setCreation('groupe')}>
+              <Icone de={Plus} /> Nouveau groupe
+            </button>
+            <button className="discret ajout-barre" onClick={() => setImport(true)}>
+              <Icone de={Upload} /> Importer un CSV
+            </button>
+            {modules.jira && (
+              <button className="discret ajout-barre" onClick={() => setJira(true)}>
+                <Icone de={RefreshCw} /> Nouvelle base Jira
+              </button>
+            )}
+          </>
+        )
+      )}
+
+      <AlerteCopies espace={espace} copies={etat.copiesConflit} />
+      {!lecture && (
+        <button className="discret modules-barre" onClick={ouvrirModules} title="Ajouter des vues, les tâches, les dashboards, l’assistant IA, Jira">
+          <Icone de={Store} />
+          Magasin
+        </button>
+      )}
+      <button
+        className="discret relire"
+        onClick={relire}
+        disabled={relu.enCours}
+        title="Relit le dossier pour voir les changements faits ailleurs (synchro, autre machine). Automatique au retour sur l'onglet."
+      >
+        <Icone de={RotateCw} className={relu.enCours ? 'tourne' : ''} />
+        {relu.enCours ? 'Relecture…' : relu.a ? `Relu à ${relu.a.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}` : 'Relire le dossier'}
+      </button>
+      {importCsv && <FenetreImport espace={espace} fermer={() => setImport(false)} ouvrir={choisir} />}
+      {jira && <FenetreBaseJira espace={espace} fermer={() => setJira(false)} ouvrir={choisir} />}
+      <button className="discret changer" onClick={changerDossier}>
+        Changer de dossier
+      </button>
+    </nav>
+  )
+}
+
+function EntreeBase(p: {
+  nom: string
+  active: boolean
+  cible: boolean
+  choisir: () => void
+  renommer: (nom: string) => void
+  dupliquer: () => void
+  portee: () => PorteeSuppressionBase
+  supprimer: () => void
+  glisser: (e: DragEvent) => void
+  onDragOver: (e: DragEvent) => void
+  onDragLeave: () => void
+  onDrop: (e: DragEvent) => void
+}) {
+  const [edition, setEdition] = useState(false)
+  const [menu, setMenu] = useState<'options' | PorteeSuppressionBase | null>(null)
+  const ancre = useRef<HTMLDivElement>(null)
+  const lecture = useConsultation()
+  if (lecture) {
+    return (
+      <div className={`entree-base ${p.active ? 'active' : ''}`} onClick={p.choisir}>
+        <span className="nom-entree">{p.nom}</span>
+      </div>
+    )
+  }
+  if (edition) {
+    return (
+      <ChampEnLigne
+        initial={p.nom}
+        valider={(nom) => {
+          setEdition(false)
+          if (nom !== p.nom) p.renommer(nom)
+        }}
+        annuler={() => setEdition(false)}
+      />
+    )
+  }
+  return (
+    <div
+      ref={ancre}
+      className={`entree-base ${p.active ? 'active' : ''} ${p.cible ? 'cible' : ''}`}
+      draggable
+      onDragStart={p.glisser}
+      onDragOver={p.onDragOver}
+      onDragLeave={p.onDragLeave}
+      onDrop={p.onDrop}
+      onClick={p.choisir}
+      onDoubleClick={() => setEdition(true)}
+      onContextMenu={(e) => {
+        e.preventDefault()
+        setMenu('options')
+      }}
+      title="Double-clic pour renommer, clic droit pour plus"
+    >
+      <span className="nom-entree">{p.nom}</span>
+      <BoutonMenuEntree ouvert={menu !== null} ouvrir={() => setMenu('options')} libelle={`Options de la base ${p.nom}`} />
+      {menu && (
+        <Flottant ancre={ancre.current} fermer={() => setMenu(null)}>
+          {menu === 'options' ? (
+            <>
+              <button className="option" onClick={() => (setMenu(null), setEdition(true))}>
+                Renommer
+              </button>
+              <button className="option" onClick={() => (setMenu(null), p.dupliquer())}>
+                Dupliquer
+              </button>
+              <button className="option danger-texte" onClick={() => setMenu(p.portee())}>
+                Supprimer la base…
+              </button>
+            </>
+          ) : (
+            <ConfirmerSuppressionBase nom={p.nom} portee={menu} annuler={() => setMenu(null)} supprimer={() => (setMenu(null), p.supprimer())} />
+          )}
+        </Flottant>
+      )}
+    </div>
+  )
+}
+
+/** Confirmation de suppression d'une base, avec tout ce qu'elle touche (spec §5). */
+function ConfirmerSuppressionBase(p: { nom: string; portee: PorteeSuppressionBase; annuler: () => void; supprimer: () => void }) {
+  const { lignes, relations, dependants, blocs } = p.portee
+  return (
+    <div className="confirmation" onClick={(e) => e.stopPropagation()}>
+      <strong>Supprimer « {p.nom} » ?</strong>
+      <p>
+        Le dossier de la base est effacé avec {lignes > 1 ? `ses ${lignes} lignes` : lignes === 1 ? 'sa ligne' : 'ses réglages'}, ses vues et ses pages. Ça ne
+        s’annule pas.
+      </p>
+      {relations.length > 0 && <p>Ces relations deviennent du texte avec les titres liés, sans rien perdre : {relations.join(', ')}.</p>}
+      {dependants.length > 0 && <p>Ces colonnes en dépendent et passeront en erreur : {dependants.join(', ')}.</p>}
+      {blocs > 0 && <p>{blocs > 1 ? `${blocs} blocs de dashboard l’affichaient et sont retirés.` : 'Un bloc de dashboard l’affichait et est retiré.'}</p>}
+      <div className="boutons">
+        <button onClick={p.annuler}>Annuler</button>
+        <button className="danger" onClick={p.supprimer}>
+          Supprimer la base
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** Bouton ⋯ d'une entrée de la barre latérale : le même menu que le clic droit. */
+function BoutonMenuEntree(p: { ouvert: boolean; ouvrir: () => void; libelle: string }) {
+  return (
+    <button
+      className="discret menu-entree"
+      aria-label={p.libelle}
+      aria-expanded={p.ouvert}
+      title="Renommer, dupliquer, supprimer"
+      onClick={(e) => {
+        e.stopPropagation()
+        p.ouvrir()
+      }}
+      onDoubleClick={(e) => e.stopPropagation()}
+    >
+      <Icone de={Ellipsis} />
+    </button>
+  )
+}
+
+function EntreeDashboard(p: {
+  nom: string
+  active: boolean
+  cible: boolean
+  choisir: () => void
+  renommer: (nom: string) => void
+  dupliquer: () => void
+  supprimer: () => void
+  glisser: (e: DragEvent) => void
+  onDragOver: (e: DragEvent) => void
+  onDragLeave: () => void
+  onDrop: (e: DragEvent) => void
+}) {
+  const [edition, setEdition] = useState(false)
+  const [menu, setMenu] = useState<'options' | 'confirmer' | null>(null)
+  const ancre = useRef<HTMLDivElement>(null)
+  const lecture = useConsultation()
+  if (lecture) {
+    return (
+      <div className={`entree-base ${p.active ? 'active' : ''}`} onClick={p.choisir}>
+        <Icone de={Table2} />
+        <span className="nom-entree">{p.nom}</span>
+      </div>
+    )
+  }
+  if (edition) {
+    return (
+      <ChampEnLigne
+        initial={p.nom}
+        valider={(nom) => {
+          setEdition(false)
+          if (nom !== p.nom) p.renommer(nom)
+        }}
+        annuler={() => setEdition(false)}
+      />
+    )
+  }
+  return (
+    <div
+      ref={ancre}
+      className={`entree-base ${p.active ? 'active' : ''} ${p.cible ? 'cible' : ''}`}
+      draggable
+      onDragStart={p.glisser}
+      onDragOver={p.onDragOver}
+      onDragLeave={p.onDragLeave}
+      onDrop={p.onDrop}
+      onClick={p.choisir}
+      onDoubleClick={() => setEdition(true)}
+      onContextMenu={(e) => {
+        e.preventDefault()
+        setMenu('options')
+      }}
+      title="Double-clic pour renommer, clic droit pour plus"
+    >
+      <Icone de={Table2} />
+      <span className="nom-entree">{p.nom}</span>
+      <BoutonMenuEntree ouvert={menu !== null} ouvrir={() => setMenu('options')} libelle={`Options du dashboard ${p.nom}`} />
+      {menu && (
+        <Flottant ancre={ancre.current} fermer={() => setMenu(null)}>
+          {menu === 'options' ? (
+            <>
+              <button className="option" onClick={() => (setMenu(null), setEdition(true))}>
+                Renommer
+              </button>
+              <button className="option" onClick={() => (setMenu(null), p.dupliquer())}>
+                Dupliquer
+              </button>
+              <button className="option danger-texte" onClick={() => setMenu('confirmer')}>
+                Supprimer le dashboard…
+              </button>
+            </>
+          ) : (
+            <div className="confirmation">
+              <strong>Supprimer « {p.nom} » ?</strong>
+              <p>Le fichier du dashboard et ses vues propres sont supprimés. Les bases et leurs vues ne changent pas.</p>
+              <div className="boutons">
+                <button onClick={() => setMenu(null)}>Annuler</button>
+                <button className="danger" onClick={() => (setMenu(null), p.supprimer())}>
+                  Supprimer
+                </button>
+              </div>
+            </div>
+          )}
+        </Flottant>
+      )}
+    </div>
+  )
+}
+
+function EnteteGroupe(p: { nom: string; replie: boolean; basculer: () => void; caches: number; renommer: (nom: string) => void; supprimer: () => void }) {
+  const [edition, setEdition] = useState(false)
+  const [menu, setMenu] = useState(false)
+  const ancre = useRef<HTMLButtonElement>(null)
+  const lecture = useConsultation()
+  if (lecture) {
+    return (
+      <div className="titre-groupe">
+        <BasculeSection nom={p.nom} replie={p.replie} basculer={p.basculer} caches={p.caches} />
+      </div>
+    )
+  }
+  if (edition) {
+    return (
+      <ChampEnLigne
+        initial={p.nom}
+        valider={(nom) => {
+          setEdition(false)
+          if (nom !== p.nom) p.renommer(nom)
+        }}
+        annuler={() => setEdition(false)}
+      />
+    )
+  }
+  return (
+    <div className="titre-groupe">
+      <BasculeSection nom={p.nom} replie={p.replie} basculer={p.basculer} caches={p.caches} renommer={() => setEdition(true)} />
+      <button ref={ancre} className="discret menu-groupe" onClick={() => setMenu(true)} aria-label="Options du groupe">
+        <Icone de={Ellipsis} />
+      </button>
+      {menu && (
+        <Flottant ancre={ancre.current} fermer={() => setMenu(false)}>
+          <button className="option" onClick={() => (setMenu(false), setEdition(true))}>
+            Renommer
+          </button>
+          <button className="option" onClick={() => (setMenu(false), p.supprimer())}>
+            Supprimer le groupe (les bases restent)
+          </button>
+        </Flottant>
+      )}
+    </div>
+  )
+}
+
+function ChampEnLigne(p: {
+  initial?: string
+  placeholder?: string
+  valider: (valeur: string) => void
+  annuler: () => void
+}) {
+  const [valeur, setValeur] = useState(p.initial ?? '')
+  const fini = useRef(false)
+  const terminer = (garder: boolean) => {
+    if (fini.current) return
+    fini.current = true
+    if (garder && valeur.trim() !== '') p.valider(valeur.trim())
+    else p.annuler()
+  }
+  return (
+    <input
+      className="champ-en-ligne"
+      autoFocus
+      placeholder={p.placeholder}
+      value={valeur}
+      onChange={(e) => setValeur(e.target.value)}
+      onBlur={() => terminer(true)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') terminer(true)
+        if (e.key === 'Escape') terminer(false)
+      }}
+    />
+  )
+}

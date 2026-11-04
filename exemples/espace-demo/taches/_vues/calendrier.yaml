@@ -1,0 +1,6 @@
+id: calendrier
+nom: Calendrier
+type: calendrier
+champ_debut: echeance
+champs_carte: [ projet ]
+echelle: mois

@@ -1,0 +1,1864 @@
+import { COULEURS } from './couleurs'
+import { chargerBase, type ChargementBase, type LigneChargee } from './base'
+import { calculer, type BaseACalculer, type Calculs } from './calcul'
+import { DepotBase, type OptionsDepot } from './depot-base'
+import { barreLaterale, lireEspace, modifierEspace, ordreDashboards, type ConfigEspace, type ConfigTaches, type Groupe, type OperationEspace, type Theme } from './espace-config'
+import { listerBases } from './espace'
+import { FichierIntrouvable, joindre, type AdaptateurFichiers } from './fichiers'
+import { cleColonne, dedoublonner, idBase } from './identifiants'
+import { dashboardsDe, preparerModele, type Modele } from './modeles'
+import { compiler, ErreurFormule } from './formules/formule'
+import {
+  appliquerEnMemoire,
+  BLOCS_PAR_RANGEE,
+  ErreurDashboard,
+  lireDashboard,
+  modifierDashboard,
+  nouveauDashboard,
+  copierDashboard,
+  type Dashboard,
+  type OperationDashboard,
+} from './dashboard'
+import { boucle } from './graphe'
+import { copieDeConflit, doublons } from './conflits'
+import { convertirValeur, type ColonneImportee } from './echange'
+import { Historique, type Changement } from './historique'
+import { IndexRecherche, type Resultat } from './recherche'
+import { MemoireAssistant } from './ia/memoire'
+import { ErreurEcriture, type Modifications } from './ligne'
+import type { Valeur } from './valeurs'
+import { CALCULS, colonne, estObjet, estSaisie, lireSchema, nomSource, type Calcul, type Colonne, type ColonneHorodatage, type ColonneRelation, type Option, type Schema, type Source } from './schema'
+import { FICHIER_SYNCHRO, lireEtatSynchro, type EtatSynchro } from './jira/synchro'
+import { schemaJira, VUE_JIRA } from './jira/ticket'
+import { copierSchema, ErreurSchema, modifierSchema, nouveauSchema, type OperationSchema } from './schema-ecriture'
+import { CHAMPS_MODIFIABLES, lireVue, modifierVue, vueParDefaut, type ModificationVue, type TypeVue, type Vue } from './vue'
+import {
+  lireMiseEnPage,
+  miseEnPageParDefaut,
+  modifierMiseEnPage,
+  type MiseEnPage,
+  type ModificationMiseEnPage,
+} from './mise-en-page'
+
+// Orchestration d'un espace ouvert : bases, barre latérale, et modifications de
+// schéma qui touchent à la fois la configuration et les lignes (spec §3, §5).
+
+export const FICHIER_ESPACE = '_espace.yaml'
+const FICHIER_SCHEMA = '_schema.yaml'
+const DOSSIER_VUES = '_vues'
+const DOSSIER_PAGES = '_pages'
+const DOSSIER_DASHBOARDS = '_dashboards'
+
+/** Types proposés à la création d'une colonne (relations, rollups, formules : jalons suivants). */
+/** Pause (ms) après laquelle une nouvelle frappe dans la même cellule ouvre une autre étape d'annulation. */
+const PAUSE_FRAPPE = 1000
+
+export const TYPES_CREABLES = ['text', 'number', 'date', 'checkbox', 'select', 'multiselect', 'url'] as const
+export type TypeCreable = (typeof TYPES_CREABLES)[number]
+
+export type EtatBase = {
+  id: string
+  chargement: ChargementBase
+  depot: DepotBase | null
+  /** Jamais vide : une base sans `_vues/` a une vue tableau implicite. */
+  vues: Vue[]
+  /** Jamais vide : une base sans `_pages/` a une mise en page implicite. */
+  pages: MiseEnPage[]
+  /** Base synchronisée (spec §16) : état de la dernière synchro (`_synchro.yaml`, écrit par le script). */
+  synchro?: EtatSynchro
+}
+
+/** Un dashboard (spec §10) ; `dashboard` null si son fichier est illisible. */
+export type EtatDashboard = { id: string; dashboard: Dashboard | null; avertissements: string[] }
+
+/** Ce que la suppression d'une base toucherait (spec §5). */
+export type PorteeSuppressionBase = { lignes: number; relations: string[]; dependants: string[]; blocs: number }
+
+export type EtatEspace = {
+  /** Dans l'ordre de la barre latérale. */
+  dashboards: EtatDashboard[]
+  groupes: Groupe[]
+  horsGroupe: string[]
+  bases: ReadonlyMap<string, EtatBase>
+  /** Valeurs des colonnes calculées (relations non propriétaires, rollups), par base puis par id. */
+  calculs: Calculs
+  /** Titre de chaque ligne, par base puis par id : pastilles de relation, liens cassés. */
+  titres: ReadonlyMap<string, ReadonlyMap<string, string>>
+  /** Ids portés par plusieurs fichiers, par base (seulement les bases concernées). */
+  doublons: ReadonlyMap<string, ReadonlyMap<string, LigneChargee[]>>
+  /** Copies de conflit de fichiers de configuration, jamais chargées (spec §4). */
+  copiesConflit: CopieConflit[]
+  /** Thème de `_espace.yaml`, avec le texte du logo SVG s'il a pu être lu. */
+  theme: Theme & { logoSvg?: string }
+  /** Base des tâches désignée dans `_espace.yaml`, telle qu'écrite (à résoudre par `resoudreBaseTaches`). */
+  taches?: ConfigTaches
+}
+
+/** `chemin` est une copie de conflit de synchro de `original` (même dossier). */
+export type CopieConflit = { chemin: string; original: string }
+
+export type OptionsEspace = OptionsDepot & {
+  /** Date du jour `AAAA-MM-JJ`, pour les filtres relatifs des rollups et les formules. */
+  aujourdhui: () => string
+  /** Date et heure `AAAA-MM-JJTHH:mm`, pour `maintenant()` ; minuit du jour par défaut. */
+  maintenant?: () => string
+}
+
+/** Ce qu'un collage sur des cellules va écrire (voir `preparerRemplacement`). */
+export type Remplacement = {
+  modifs: { chemin: string; cle: string; valeur: Valeur | undefined }[]
+  nouvelles: Modifications[]
+  /** Options de sélection à créer d'abord. */
+  options: { cle: string; label: string }[]
+  /** Valeurs laissées de côté : colonne calculée, hors du tableau, ou texte illisible pour son type. */
+  ignorees: number
+  /** Lignes existantes touchées. */
+  lignes: number
+}
+
+export class DepotEspace {
+  private readonly adaptateur: AdaptateurFichiers
+  private readonly options: OptionsEspace
+  private readonly bases = new Map<string, EtatBase>()
+  private readonly dashboards = new Map<string, EtatDashboard>()
+  private config: ConfigEspace = lireEspace(null)
+  private logoSvg: string | undefined
+  private instantane: EtatEspace = { dashboards: [], groupes: [], horsGroupe: [], bases: new Map(), calculs: new Map(), titres: new Map(), doublons: new Map(), copiesConflit: [], theme: { couleurs: {} } }
+  private readonly abonnes = new Set<() => void>()
+  /** Bases dont le `_schema.yaml` manquait à la dernière relecture (voir `rafraichirBase`). */
+  private readonly schemasAbsents = new Set<string>()
+  private readonly recherche = new IndexRecherche()
+  /** Sérialise les modifications de configuration. */
+  private file: Promise<unknown> = Promise.resolve()
+  /** Modifications de configuration appliquées en mémoire mais pas encore écrites. */
+  private configEnVol = 0
+  private copies: CopieConflit[] = []
+  /** Mémoire et skills de l'assistant IA (`_assistant/`, spec §3). */
+  readonly assistant: MemoireAssistant
+  /** Annuler / rétablir sur les données (cellules, lignes créées ou supprimées). */
+  private readonly historique = new Historique()
+  /** Une pause dans la frappe clôt l'étape d'annulation de la cellule en cours. */
+  private arreterFrappe: (() => void) | undefined
+
+  private constructor(adaptateur: AdaptateurFichiers, options: OptionsEspace) {
+    this.adaptateur = adaptateur
+    this.options = options
+    this.assistant = new MemoireAssistant(adaptateur)
+  }
+
+  static async ouvrir(adaptateur: AdaptateurFichiers, options: OptionsEspace): Promise<DepotEspace> {
+    const d = new DepotEspace(adaptateur, options)
+    d.config = lireEspace(await d.lireOuNull(FICHIER_ESPACE))
+    d.logoSvg = await d.lireLogo()
+    for (const id of await listerBases(adaptateur)) await d.chargerBase(id)
+    await d.chargerDashboards()
+    d.copies = await d.chercherCopies()
+    d.publier()
+    return d
+  }
+
+  etat = (): EtatEspace => this.instantane
+
+  abonner = (fn: () => void): (() => void) => {
+    this.abonnes.add(fn)
+    return () => this.abonnes.delete(fn)
+  }
+
+  async vider(): Promise<void> {
+    await Promise.all([...this.bases.values()].map((b) => b.depot?.vider()))
+  }
+
+  // ── Changements externes ─────────────────────────────────────────
+
+  /**
+   * Relit l'espace sur le disque (spec §12) : au retour sur l'onglet ou à la
+   * demande. Bases ajoutées ou retirées, schémas, lignes, vues, mises en page,
+   * dashboards et barre latérale. Ce qui n'a pas changé garde son état en mémoire.
+   * Renvoie vrai si quelque chose a changé.
+   */
+  rafraichir(): Promise<boolean> {
+    return this.enFile(() => this.relire())
+  }
+
+  private async relire(): Promise<boolean> {
+    let change = false
+    const config = lireEspace(await this.lireOuNull(FICHIER_ESPACE))
+    if (!memes(config, this.config)) {
+      this.config = config
+      change = true
+    }
+    const logo = await this.lireLogo()
+    if (logo !== this.logoSvg) {
+      this.logoSvg = logo
+      change = true
+    }
+    const ids = await listerBases(this.adaptateur)
+    for (const id of [...this.bases.keys()]) {
+      if (ids.includes(id)) continue
+      this.bases.delete(id)
+      change = true
+    }
+    for (const id of ids) {
+      const b = this.bases.get(id)
+      if (b?.depot) {
+        change = (await this.rafraichirBase(b, b.depot)) || change
+        continue
+      }
+      // Nouveau dossier, ou dossier qui n'était pas une base : on le recharge en entier.
+      await this.chargerBase(id)
+      if (!b || !memes(b.chargement, this.bases.get(id)!.chargement)) change = true
+    }
+    if (this.configEnVol === 0) {
+      const avant = new Map(this.dashboards)
+      this.dashboards.clear()
+      await this.chargerDashboards()
+      if (!memes([...avant], [...this.dashboards])) change = true
+      else for (const [id, d] of avant) this.dashboards.set(id, d) // mêmes objets : rien ne se redessine
+    }
+    const copies = await this.chercherCopies()
+    if (!memes(copies, this.copies)) {
+      this.copies = copies
+      change = true
+    }
+    if (change) this.publier()
+    return change
+  }
+
+  /** Les deux textes d'une copie de conflit, pour choisir. */
+  async lireCopieConflit(chemin: string): Promise<{ original: string | null; copie: string }> {
+    const c = this.copies.find((x) => x.chemin === chemin)
+    if (!c) throw new ErreurSchema(`Copie de conflit inconnue : ${chemin}`)
+    return { original: await this.lireOuNull(c.original), copie: await this.adaptateur.lire(chemin) }
+  }
+
+  /**
+   * Tranche une copie de conflit : garder l'original (la copie est supprimée)
+   * ou garder la copie (elle remplace l'original). Puis relit l'espace.
+   */
+  resoudreCopieConflit(chemin: string, garder: 'original' | 'copie'): Promise<void> {
+    return this.enFile(async () => {
+      const c = this.copies.find((x) => x.chemin === chemin)
+      if (!c) throw new ErreurSchema(`Copie de conflit inconnue : ${chemin}`)
+      if (garder === 'copie') await this.adaptateur.ecrire(c.original, await this.adaptateur.lire(chemin))
+      await this.adaptateur.supprimer(chemin)
+      await this.relire()
+    })
+  }
+
+  /** Copies de conflit parmi les fichiers de configuration : racine, dashboards, et chaque base avec ses vues et mises en page. */
+  private async chercherCopies(): Promise<CopieConflit[]> {
+    const dossiers = ['', DOSSIER_DASHBOARDS, ...[...this.bases.keys()].flatMap((b) => [b, joindre(b, DOSSIER_VUES), joindre(b, DOSSIER_PAGES)])]
+    const copies: CopieConflit[] = []
+    for (const dossier of dossiers) {
+      let entrees
+      try {
+        entrees = await this.adaptateur.lister(dossier)
+      } catch (e) {
+        if (e instanceof FichierIntrouvable) continue
+        throw e
+      }
+      const noms = new Set(entrees.filter((e) => e.type === 'fichier').map((e) => e.nom))
+      for (const nom of noms) {
+        if (!nom.endsWith('.yaml')) continue
+        const original = copieDeConflit(nom, noms)
+        if (original) copies.push({ chemin: joindre(dossier, nom), original: joindre(dossier, original) })
+      }
+    }
+    return copies
+  }
+
+  private async rafraichirBase(b: EtatBase, depot: DepotBase): Promise<boolean> {
+    if (!b.chargement.ok) return false
+    let change = false
+    let base = b.chargement.base
+    const texte = await this.lireOuNull(joindre(b.id, FICHIER_SCHEMA))
+    if (texte === null && !this.schemasAbsents.has(b.id)) {
+      // Absent une fois : souvent un fichier en cours de remplacement (synchro, autre app).
+      // La base reste telle quelle ; absent encore à la relecture suivante, elle n'en est plus une.
+      this.schemasAbsents.add(b.id)
+      return false
+    }
+    this.schemasAbsents.delete(b.id)
+    if (texte === null) {
+      this.bases.set(b.id, { id: b.id, chargement: { ok: false, raison: 'pas de _schema.yaml' }, depot: null, vues: [], pages: [] })
+      return true
+    }
+    const lu = lireSchema(texte, b.id)
+    const avertissementsSchema = lu.schema ? lu.avertissements : [`_schema.yaml illisible sur le disque, dernière version lisible gardée : ${lu.avertissements.join(' ; ')}`]
+    if (lu.schema && !memes(lu.schema, depot.schema)) {
+      depot.remplacerSchema(lu.schema)
+      change = true
+    }
+    const lignes = await depot.rafraichir()
+    if (lignes) {
+      change ||= lignes.change
+      if (!memes(lignes.nonReconnus, base.nonReconnus)) {
+        base = { ...base, nonReconnus: lignes.nonReconnus }
+        change = true
+      }
+    }
+    let { vues, pages } = b
+    if (this.configEnVol === 0) {
+      const v = await this.chargerVues(b.id, depot.schema.ordreVues)
+      const p = await this.chargerPages(b.id)
+      if (!memes(v.vues, vues)) vues = v.vues
+      if (!memes(p.pages, pages)) pages = p.pages
+      const avertissements = [...avertissementsSchema, ...v.avertissements, ...p.avertissements]
+      if (!memes(avertissements, base.avertissements)) base = { ...base, avertissements }
+    }
+    let synchro = b.synchro
+    if (depot.schema.source) {
+      const lu = await this.lireSynchro(b.id)
+      if (!memes(lu, synchro)) synchro = lu
+    }
+    if (vues !== b.vues || pages !== b.pages || synchro !== b.synchro || base !== b.chargement.base || depot.schema !== b.chargement.base.schema) {
+      this.bases.set(b.id, { ...b, vues, pages, ...(synchro && { synchro }), chargement: { ok: true, base: { ...base, schema: depot.schema } } })
+      change = true
+    }
+    return change
+  }
+
+  // ── Bases et groupes ─────────────────────────────────────────────
+
+  creerBase(nom: string, groupe: string | null = null): Promise<string> {
+    return this.enFile(async () => {
+      const pris = (await this.adaptateur.lister('')).map((e) => e.nom)
+      const id = idBase(nom, pris)
+      await this.adaptateur.ecrire(joindre(id, FICHIER_SCHEMA), nouveauSchema(id, nom.trim() || id))
+      await this.modifierEspace({ type: 'placer_base', base: id, groupe })
+      await this.chargerBase(id)
+      this.publier()
+      return id
+    })
+  }
+
+  /**
+   * Installe un modèle (spec §19 « Modèles ») : ses bases dans un nouveau groupe
+   * nommé comme lui, ses dashboards à la suite. N'écrit que des fichiers neufs ;
+   * un identifiant déjà pris est dédoublonné, et ses références suivent.
+   */
+  utiliserModele(m: Modele): Promise<{ groupe: string; bases: string[]; dashboards: string[] }> {
+    return this.enFile(async () => {
+      const prises = new Set((await this.adaptateur.lister('')).map((e) => e.nom))
+      const ids = new Map<string, string>()
+      for (const b of m.bases) {
+        const id = dedoublonner(b, prises, '-')
+        prises.add(id)
+        ids.set(b, id)
+      }
+      const dashboards = new Map<string, string>()
+      const dashboardsPris = new Set(this.dashboards.keys())
+      for (const d of dashboardsDe(m)) {
+        const id = dedoublonner(d, dashboardsPris, '-')
+        dashboardsPris.add(id)
+        dashboards.set(d, id)
+      }
+      for (const [chemin, texte] of Object.entries(preparerModele(m, ids, dashboards, this.options.aujourdhui()))) await this.adaptateur.ecrire(chemin, texte)
+      const groupe = dedoublonner(m.nom, new Set(this.config.groupes.map((g) => g.nom)), ' ')
+      await this.modifierEspace({ type: 'ajouter_groupe', nom: groupe })
+      for (const id of ids.values()) {
+        await this.modifierEspace({ type: 'placer_base', base: id, groupe })
+        await this.chargerBase(id)
+      }
+      for (const id of dashboards.values()) {
+        this.dashboards.set(id, { id, ...lireDashboard(await this.adaptateur.lire(cheminDashboard(id)), id) })
+        await this.modifierEspace({ type: 'ajouter_dashboard', id })
+      }
+      this.publier()
+      return { groupe, bases: [...ids.values()], dashboards: [...dashboards.values()] }
+    })
+  }
+
+  /** Désigne la base des tâches (spec §9 « Base des tâches »), ou la retire (null). */
+  reglerTaches(taches: ConfigTaches | null): Promise<void> {
+    return this.enFile(() => this.modifierEspace({ type: 'regler_taches', taches }))
+  }
+
+  /**
+   * « Créer une base Tâches » : titre, fait (case), échéance, priorité, et la
+   * base aussitôt désignée comme base des tâches.
+   */
+  async creerBaseTaches(groupe: string | null = null): Promise<string> {
+    const base = await this.creerBase('Tâches', groupe)
+    const fait = await this.ajouterColonne(base, 'Fait', 'checkbox')
+    const echeance = await this.ajouterColonne(base, 'Échéance', 'date')
+    const priorite = await this.ajouterColonne(base, 'Priorité', 'select')
+    for (const label of ['Haute', 'Moyenne', 'Basse']) await this.ajouterOption(base, priorite, label)
+    await this.reglerTaches({ base, fait, echeance })
+    return base
+  }
+
+  /**
+   * Sous-tâches de la base des tâches : l'auto-relation désignée, ou créée à
+   * la volée (« Tâche parente » / « Sous-tâches », masquées dans l'affichage
+   * existant) et écrite dans `sous_taches`. Rend la clé côté sous-tâches.
+   */
+  async activerSousTaches(): Promise<string> {
+    const config = this.config.taches
+    if (!config) throw new ErreurSchema('Aucune base des tâches')
+    if (config.sous_taches) return config.sous_taches
+    const { miroir } = await this.ajouterRelationDiscrete(config.base, 'Tâche parente', config.base, 'Sous-tâches')
+    await this.reglerTaches({ ...(this.config.taches ?? config), sous_taches: miroir })
+    return miroir
+  }
+
+  /**
+   * Relation de la base des tâches vers `base` (la première), créée à la
+   * volée si elle n'existe pas (spec §9 « Base des tâches ») ; `creee` dit le
+   * nom de la base liée quand elle vient d'être créée.
+   */
+  private async relationDesTaches(base: string): Promise<{ cle: string; creee: string | null }> {
+    const config = this.config.taches
+    if (!config) throw new ErreurSchema('Aucune base des tâches')
+    if (base === config.base) throw new ErreurSchema('Une tâche se lie à une sous-tâche par « Ajouter une sous-tâche »')
+    const existante = this.schema(config.base).colonnes.find((c) => c.type === 'relation' && c.cible === base)
+    if (existante) return { cle: existante.cle, creee: null }
+    const nom = this.schema(base).nom
+    const { cle } = await this.ajouterRelationDiscrete(config.base, nom, base)
+    return { cle, creee: nom }
+  }
+
+  /**
+   * Crée une tâche dans la base des tâches, liée aux lignes `liens` (de
+   * n'importe quelle base : la relation manquante est créée d'abord), avec
+   * d'autres valeurs (lien à sa tâche parente…). Rend la ligne et les bases
+   * dont la relation vient d'être créée.
+   */
+  async creerTache(texte: string, liens: readonly { base: string; id: string }[] = [], valeurs: Modifications = {}): Promise<{ ligne: LigneChargee; relationsCreees: string[] }> {
+    const config = this.config.taches
+    if (!config) throw new ErreurSchema('Aucune base des tâches')
+    const toutes: Modifications = { ...valeurs }
+    const relationsCreees: string[] = []
+    for (const l of liens) {
+      const { cle, creee } = await this.relationDesTaches(l.base)
+      if (creee) relationsCreees.push(creee)
+      const deja = toutes[cle]
+      toutes[cle] = [...new Set([...(Array.isArray(deja) ? deja : []), l.id])]
+    }
+    const ligne = await this.creerLigne(config.base, { ...toutes, [this.schema(config.base).champTitre]: texte })
+    return { ligne, relationsCreees }
+  }
+
+  /** Lie une tâche existante à une ligne de n'importe quelle base (la relation manquante est créée d'abord). */
+  async lierTache(idTache: string, base: string, id: string): Promise<{ relationCreee: string | null }> {
+    const config = this.config.taches
+    if (!config) throw new ErreurSchema('Aucune base des tâches')
+    const { cle, creee } = await this.relationDesTaches(base)
+    const c = colonne(this.schema(config.base), cle) as ColonneRelation
+    const actuels = c.proprietaire ? idsDe(this.ligne(config.base, idTache), cle) : this.idsCalcules(config.base, idTache, cle)
+    if (!actuels.includes(id)) this.modifierRelation(config.base, idTache, cle, [...actuels, id])
+    return { relationCreee: creee }
+  }
+
+  /**
+   * Crée une base Jira (spec §16) : colonnes fixées, `source` dans le schéma ;
+   * ses lignes ne sont écrites que par le script de synchro.
+   */
+  creerBaseJira(nom: string, source: Source, groupe: string | null = null): Promise<string> {
+    return this.enFile(async () => {
+      const pris = (await this.adaptateur.lister('')).map((e) => e.nom)
+      const id = idBase(nom, pris)
+      await this.adaptateur.ecrire(joindre(id, '_vues', 'tableau.yaml'), VUE_JIRA)
+      await this.adaptateur.ecrire(joindre(id, FICHIER_SCHEMA), schemaJira(id, nom.trim() || id, source))
+      await this.modifierEspace({ type: 'placer_base', base: id, groupe })
+      await this.chargerBase(id)
+      this.publier()
+      return id
+    })
+  }
+
+  /** Réglages d'une base synchronisée (spec §16) : site, projets suivis, filtre JQL. Le script les relit à chaque passage. */
+  modifierSource(base: string, source: Source): Promise<void> {
+    return this.enFile(() => this.modifierSchema(base, { type: 'source', source }))
+  }
+
+  private async lireSynchro(base: string): Promise<EtatSynchro> {
+    return lireEtatSynchro(await this.lireOuNull(joindre(base, FICHIER_SYNCHRO)))
+  }
+
+  /**
+   * Duplique une base (spec §5) : lignes, vues et mises en page copiées telles
+   * quelles (mêmes ids de ligne, propres à la base), le schéma écrit en dernier
+   * pour qu'une coupure laisse un dossier qui n'est pas encore une base. Chaque
+   * relation de la copie devient propriétaire avec sa propre colonne miroir
+   * dans la base cible : les liens d'un côté non propriétaire, calculés, sont
+   * écrits dans les lignes de la copie. La copie se place juste après l'original.
+   */
+  dupliquerBase(id: string): Promise<string> {
+    return this.enFile(async () => {
+      const schema = this.schema(id)
+      // Une auto-relation (spec §5) se copie vers la copie elle-même, ses liens tels quels ; les autres relations gagnent une miroir.
+      const toutes = schema.colonnes.filter((c): c is ColonneRelation => c.type === 'relation')
+      const autos = toutes.filter((c) => c.cible === id)
+      const relations = toutes.filter((c) => c.cible !== id)
+      for (const c of relations) this.schema(c.cible)
+      const nom = `${schema.nom} (copie)`
+      const copie = idBase(nom, (await this.adaptateur.lister('')).map((e) => e.nom))
+      // Liens calculés des relations non propriétaires, lus avant toute écriture.
+      const liens = new Map<string, Map<string, Valeur>>()
+      for (const c of relations.filter((r) => !r.proprietaire)) {
+        const valeurs = new Map<string, Valeur>()
+        for (const l of this.depot(id).lignes()) {
+          const ids = this.idsCalcules(id, l.id, c.cle)
+          if (ids.length > 0) valeurs.set(l.id, ids)
+        }
+        liens.set(c.cle, valeurs)
+      }
+      await this.copierDossier(id, copie)
+      let texte = copierSchema(await this.adaptateur.lire(joindre(id, FICHIER_SCHEMA)), copie, nom)
+      for (const c of autos) texte = modifierSchema(texte, { type: 'modifier_colonne', cle: c.cle, proprietes: { cible: copie } })
+      const miroirs: [string, Colonne][] = []
+      const prises = new Map<string, string[]>()
+      for (const c of relations) {
+        const cles = prises.get(c.cible) ?? this.schema(c.cible).colonnes.map((x) => x.cle)
+        const cleMiroir = cleColonne(nom, cles)
+        prises.set(c.cible, [...cles, cleMiroir])
+        texte = modifierSchema(texte, { type: 'modifier_colonne', cle: c.cle, proprietes: { proprietaire: true, inverse: cleMiroir } })
+        miroirs.push([c.cible, { cle: cleMiroir, nom, type: 'relation', cible: copie, proprietaire: false, inverse: c.cle }])
+      }
+      await this.adaptateur.ecrire(joindre(copie, FICHIER_SCHEMA), texte)
+      for (const [cible, miroir] of miroirs) await this.modifierSchema(cible, { type: 'ajouter_colonne', colonne: miroir })
+      await this.chargerBase(copie)
+      for (const [cle, valeurs] of liens) await this.depot(copie).reecrireColonne(cle, valeurs)
+      const { groupes, horsGroupe } = barreLaterale(this.config, [...this.bases.keys()])
+      const groupe = groupes.find((g) => g.bases.includes(id))
+      const liste = groupe?.bases ?? horsGroupe
+      await this.modifierEspace({ type: 'placer_base', base: copie, groupe: groupe?.nom ?? null, index: liste.indexOf(id) + 1 })
+      return copie
+    })
+  }
+
+  /** Copie récursive d'un dossier de base, sans son `_schema.yaml` (écrit à part). */
+  private async copierDossier(de: string, vers: string, racine = true): Promise<void> {
+    for (const e of await this.adaptateur.lister(de)) {
+      if (e.nom.startsWith('.') || (racine && e.nom === FICHIER_SCHEMA)) continue
+      const source = joindre(de, e.nom)
+      if (e.type === 'dossier') await this.copierDossier(source, joindre(vers, e.nom), false)
+      else await this.adaptateur.ecrire(joindre(vers, e.nom), await this.adaptateur.lire(source))
+    }
+  }
+
+  renommerBase(id: string, nom: string): Promise<void> {
+    return this.enFile(() => this.modifierSchema(id, { type: 'renommer_base', nom }))
+  }
+
+  placerBase(id: string, groupe: string | null, index?: number): Promise<void> {
+    return this.enFile(() => this.modifierEspace({ type: 'placer_base', base: id, groupe, ...(index !== undefined && { index }) }))
+  }
+
+  ajouterGroupe(nom: string): Promise<void> {
+    return this.enFile(() => this.modifierEspace({ type: 'ajouter_groupe', nom }))
+  }
+
+  renommerGroupe(nom: string, nouveau: string): Promise<void> {
+    return this.enFile(() => this.modifierEspace({ type: 'renommer_groupe', nom, nouveau }))
+  }
+
+  supprimerGroupe(nom: string): Promise<void> {
+    return this.enFile(() => this.modifierEspace({ type: 'supprimer_groupe', nom }))
+  }
+
+  /** Ce que supprimer une base toucherait, à montrer avant de confirmer (spec §5). */
+  porteeSuppressionBase(id: string): PorteeSuppressionBase {
+    const lignes = this.bases.get(id)?.depot?.lignes().length ?? 0
+    const relations: string[] = []
+    const dependants: string[] = []
+    for (const [b, c] of this.relationsVers(id)) {
+      relations.push(`${this.schema(b).nom} › ${c.nom}`)
+      dependants.push(...this.dependants(b, c.cle).filter((d) => !d.startsWith(`${this.schema(id).nom} › `)))
+    }
+    const blocs = [...this.dashboards.values()].flatMap((d) => d.dashboard?.rangees.flatMap((r) => r.blocs) ?? []).filter((b) => 'base' in b && b.base === id).length
+    return { lignes, relations, dependants: [...new Set(dependants)], blocs }
+  }
+
+  /**
+   * Supprime une base (spec §5). Chaque relation qui pointait vers elle devient
+   * une colonne texte avec les titres des lignes liées, les blocs de dashboard
+   * qui l'affichaient sont retirés, puis le dossier est effacé, schéma en
+   * premier : une coupure laisse un dossier qui n'est plus une base, jamais une
+   * base à moitié vide. Ne s'annule pas.
+   */
+  supprimerBase(id: string): Promise<void> {
+    return this.enFile(async () => {
+      this.schema(id)
+      const titres = this.instantane.titres.get(id) ?? new Map<string, string>()
+      for (const [b, c] of this.relationsVers(id)) {
+        const valeurs = new Map<string, Valeur>()
+        for (const l of this.depot(b).lignes()) {
+          const cellule = l.cellules[c.cle]
+          const ids = !c.proprietaire ? this.idsCalcules(b, l.id, c.cle) : cellule?.etat === 'ok' && Array.isArray(cellule.valeur) ? cellule.valeur : []
+          const liees = ids.map((x) => titres.get(x) || x)
+          if (liees.length > 0) valeurs.set(l.id, liees.join(', '))
+        }
+        await this.modifierSchema(b, { type: 'relation_en_texte', cle: c.cle })
+        await this.depot(b).reecrireColonne(c.cle, valeurs)
+      }
+      for (const [idDash, d] of this.dashboards) {
+        const places = (d.dashboard?.rangees ?? []).flatMap((r, rangee) => r.blocs.map((bloc, i) => ({ rangee, bloc: i, base: 'base' in bloc ? bloc.base : undefined })))
+        const retirees = places.filter((p) => p.base === id).reverse()
+        if (retirees.length === 0) continue
+        const chemin = cheminDashboard(idDash)
+        let texte = await this.adaptateur.lire(chemin)
+        let dashboard = d.dashboard!
+        for (const { rangee, bloc } of retirees) {
+          const op: OperationDashboard = { type: 'retirer_bloc', place: { rangee, bloc } }
+          texte = modifierDashboard(texte, op)
+          dashboard = appliquerEnMemoire(dashboard, op)
+        }
+        await this.adaptateur.ecrire(chemin, texte)
+        this.dashboards.set(idDash, { ...d, dashboard })
+      }
+      await this.bases.get(id)?.depot?.vider()
+      await this.adaptateur.supprimer(joindre(id, FICHIER_SCHEMA))
+      await this.effacerDossier(id)
+      this.bases.delete(id)
+      await this.modifierEspace({ type: 'retirer_base', base: id })
+      this.publier()
+    })
+  }
+
+  /** Relations d'autres bases qui pointent vers `id`, des deux côtés. */
+  private relationsVers(id: string): [string, ColonneRelation][] {
+    return [...this.bases.values()].flatMap((b) =>
+      b.id !== id && b.chargement.ok ? b.chargement.base.schema.colonnes.flatMap((c): [string, ColonneRelation][] => (c.type === 'relation' && c.cible === id ? [[b.id, c]] : [])) : [],
+    )
+  }
+
+  /** Efface un dossier et tout ce qu'il contient, fichiers d'abord. */
+  private async effacerDossier(dossier: string): Promise<void> {
+    let entrees
+    try {
+      entrees = await this.adaptateur.lister(dossier)
+    } catch (e) {
+      if (e instanceof FichierIntrouvable) return
+      throw e
+    }
+    for (const e of entrees) {
+      const chemin = joindre(dossier, e.nom)
+      if (e.type === 'dossier') await this.effacerDossier(chemin)
+      else await this.adaptateur.supprimer(chemin)
+    }
+    await this.adaptateur.supprimer(dossier)
+  }
+
+  // ── Dashboards ───────────────────────────────────────────────────
+
+  creerDashboard(nom: string): Promise<string> {
+    return this.enFile(async () => {
+      const id = idBase(nom, [...this.dashboards.keys()])
+      const texte = nouveauDashboard(id, nom.trim() || id)
+      await this.adaptateur.ecrire(cheminDashboard(id), texte)
+      this.dashboards.set(id, { id, ...lireDashboard(texte, id) })
+      await this.modifierEspace({ type: 'ajouter_dashboard', id })
+      return id
+    })
+  }
+
+  /** Duplique un dashboard, placé juste après l'original dans la barre latérale. */
+  dupliquerDashboard(id: string): Promise<string> {
+    return this.enFile(async () => {
+      const d = this.dashboards.get(id)
+      if (!d) throw new ErreurDashboard(`Dashboard introuvable : ${id}`)
+      const nom = `${d.dashboard?.nom ?? id} (copie)`
+      const copie = idBase(nom, [...this.dashboards.keys()])
+      const texte = copierDashboard(await this.adaptateur.lire(cheminDashboard(id)), copie, nom)
+      await this.adaptateur.ecrire(cheminDashboard(copie), texte)
+      const ordre = ordreDashboards(this.config, [...this.dashboards.keys()])
+      this.dashboards.set(copie, { id: copie, ...lireDashboard(texte, copie) })
+      ordre.splice(ordre.indexOf(id) + 1, 0, copie)
+      await this.modifierEspace({ type: 'ordre_dashboards', ids: ordre })
+      return copie
+    })
+  }
+
+  /** Déplace un dashboard à `index` dans l'ordre de la barre latérale. */
+  deplacerDashboard(id: string, index: number): Promise<void> {
+    return this.enFile(async () => {
+      const ordre = ordreDashboards(this.config, [...this.dashboards.keys()]).filter((x) => x !== id)
+      ordre.splice(Math.max(0, Math.min(index, ordre.length)), 0, id)
+      await this.modifierEspace({ type: 'ordre_dashboards', ids: ordre })
+    })
+  }
+
+  supprimerDashboard(id: string): Promise<void> {
+    return this.enFile(async () => {
+      await this.adaptateur.supprimer(cheminDashboard(id))
+      this.dashboards.delete(id)
+      await this.modifierEspace({ type: 'retirer_dashboard', id })
+    })
+  }
+
+  /**
+   * Modifie un dashboard : l'affichage change tout de suite, le fichier suit,
+   * relu sur le disque et réécrit seulement là où l'opération le touche.
+   */
+  modifierDashboard(id: string, op: OperationDashboard): Promise<void> {
+    const d = this.dashboards.get(id)?.dashboard
+    if (!d) return Promise.reject(new ErreurDashboard(`Dashboard introuvable ou illisible : ${id}`))
+    if (op.type === 'ajouter_bloc') {
+      if ('base' in op.bloc && !this.bases.get(op.bloc.base)?.chargement.ok) return Promise.reject(new ErreurDashboard(`Base introuvable : ${op.bloc.base}`))
+      if (op.rangee !== null && (d.rangees[op.rangee]?.blocs.length ?? BLOCS_PAR_RANGEE) >= BLOCS_PAR_RANGEE) {
+        return Promise.reject(new ErreurDashboard(`Une rangée tient ${BLOCS_PAR_RANGEE} blocs au plus`))
+      }
+    }
+    let suivant: Dashboard
+    try {
+      suivant = appliquerEnMemoire(d, op)
+    } catch (e) {
+      return Promise.reject(e instanceof Error ? e : new ErreurDashboard(String(e)))
+    }
+    this.dashboards.set(id, { ...this.dashboards.get(id)!, dashboard: suivant })
+    this.publier()
+    return this.apresMemoire(async () => {
+      const chemin = cheminDashboard(id)
+      await this.adaptateur.ecrire(chemin, modifierDashboard(await this.adaptateur.lire(chemin), op))
+    })
+  }
+
+  private async chargerDashboards() {
+    let entrees
+    try {
+      entrees = await this.adaptateur.lister(DOSSIER_DASHBOARDS)
+    } catch (e) {
+      if (e instanceof FichierIntrouvable) return
+      throw e
+    }
+    const noms = new Set(entrees.map((e) => e.nom))
+    for (const e of entrees) {
+      if (e.type !== 'fichier' || !e.nom.endsWith('.yaml') || copieDeConflit(e.nom, noms)) continue
+      const id = e.nom.slice(0, -'.yaml'.length)
+      this.dashboards.set(id, { id, ...lireDashboard(await this.adaptateur.lire(joindre(DOSSIER_DASHBOARDS, e.nom)), id) })
+    }
+  }
+
+  // ── Colonnes ─────────────────────────────────────────────────────
+
+  ajouterColonne(base: string, nom: string, type: TypeCreable): Promise<string> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      const schema = this.schema(base)
+      const cle = cleColonne(nom, schema.colonnes.map((c) => c.cle))
+      const nomAffiche = nom.trim() || cle
+      const nouvelle: Colonne =
+        type === 'select' || type === 'multiselect'
+          ? { cle, nom: nomAffiche, type, options: [] }
+          : { cle, nom: nomAffiche, type }
+      await this.modifierSchema(base, { type: 'ajouter_colonne', colonne: nouvelle })
+      return cle
+    })
+  }
+
+  /** Colonne « Créé le » ou « Modifié le » (spec §3) : calculée, elle ne touche que `_schema.yaml`. */
+  ajouterHorodatage(base: string, nom: string, type: ColonneHorodatage['type']): Promise<string> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      const schema = this.schema(base)
+      const cle = cleColonne(nom, schema.colonnes.map((c) => c.cle))
+      await this.modifierSchema(base, { type: 'ajouter_colonne', colonne: { cle, nom: nom.trim() || cle, type } })
+      return cle
+    })
+  }
+
+  /** Ne modifie que `_schema.yaml` : la clé ne change jamais (invariant 3). */
+  renommerColonne(base: string, cle: string, nom: string): Promise<void> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      await this.modifierSchema(base, { type: 'renommer_colonne', cle, nom })
+    })
+  }
+
+  deplacerColonne(base: string, cle: string, index: number): Promise<void> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      await this.modifierSchema(base, { type: 'deplacer_colonne', cle, index })
+    })
+  }
+
+  /** Colonnes calculées qui dépendent de `cle`, à montrer avant une suppression (spec §5). */
+  dependants(base: string, cle: string): string[] {
+    const cibles: [string, string][] = [[base, cle]]
+    // Supprimer une relation supprime aussi sa colonne miroir : ses dépendants comptent.
+    const c = this.bases.get(base)?.chargement.ok ? colonne(this.schema(base), cle) : undefined
+    if (c?.type === 'relation') cibles.push([c.cible, c.inverse])
+    const trouves: string[] = []
+    for (const [b, k] of cibles) {
+      for (const autre of this.bases.values()) {
+        if (!autre.chargement.ok) continue
+        const s = autre.chargement.base.schema
+        for (const x of s.colonnes) {
+          if (x.cle === k && autre.id === b) continue
+          const local = autre.id === b
+          const depend =
+            (local && x.type === 'formula' && x.expression.includes(`prop("${k}")`)) ||
+            (local && x.type === 'rollup' && x.relation === k) ||
+            (x.type === 'rollup' && relationVers(s, x.relation) === b && x.champ === k)
+          if (depend) trouves.push(`${s.nom} › ${x.nom}`)
+        }
+      }
+    }
+    return [...new Set(trouves)]
+  }
+
+  /**
+   * Supprime une colonne et son contenu (spec §5) : les valeurs sont d'abord
+   * retirées des fichiers de lignes, puis la colonne du schéma. Une coupure en
+   * cours de route laisse donc une colonne existante, partiellement vidée.
+   * Renvoie le nombre de fichiers de lignes réécrits.
+   */
+  supprimerColonne(base: string, cle: string): Promise<number> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      const schema = this.schema(base)
+      if (cle === schema.champTitre) {
+        throw new ErreurSchema('La colonne titre ne peut pas être supprimée : choisis d’abord une autre colonne titre')
+      }
+      const c = colonne(schema, cle)
+      if (c?.type === 'relation') return this.supprimerRelation(base, c)
+      const n = c && estSaisie(c) ? await this.depot(base).effacerColonne(cle) : 0
+      await this.modifierSchema(base, { type: 'supprimer_colonne', cle })
+      return n
+    })
+  }
+
+  /**
+   * Supprime une relation depuis l'un ou l'autre côté (spec §5) : les ids sont
+   * retirés des fichiers du côté propriétaire, puis les deux colonnes des schémas.
+   */
+  private async supprimerRelation(base: string, c: ColonneRelation): Promise<number> {
+    const [baseProprio, cleProprio, baseMiroir, cleMiroir] = c.proprietaire
+      ? [base, c.cle, c.cible, c.inverse]
+      : [c.cible, c.inverse, base, c.cle]
+    const proprio = this.bases.get(baseProprio)?.chargement.ok ? colonne(this.schema(baseProprio), cleProprio) : undefined
+    const n = proprio?.type === 'relation' && proprio.proprietaire ? await this.depot(baseProprio).effacerColonne(cleProprio) : 0
+    if (proprio) await this.modifierSchema(baseProprio, { type: 'supprimer_colonne', cle: cleProprio })
+    const miroir = this.bases.get(baseMiroir)?.chargement.ok ? colonne(this.schema(baseMiroir), cleMiroir) : undefined
+    if (miroir?.type === 'relation' && miroir.cible === baseProprio) {
+      await this.modifierSchema(baseMiroir, { type: 'supprimer_colonne', cle: cleMiroir })
+    }
+    return n
+  }
+
+  /**
+   * Crée une relation bidirectionnelle (spec §5) : la colonne propriétaire ici,
+   * la colonne miroir (nommée d'après cette base, ou `nomMiroir`) dans la base
+   * cible. Vers sa propre base (auto-relation), les deux colonnes sont dans le
+   * même schéma ; la miroir s'appelle alors « <nom> (inverse) » par défaut.
+   */
+  ajouterRelation(base: string, nom: string, cible: string, nomMiroir?: string): Promise<string> {
+    return this.enFile(() => this.ajouterRelationSansFile(base, nom, cible, nomMiroir))
+  }
+
+  private async ajouterRelationSansFile(base: string, nom: string, cible: string, nomMiroir?: string): Promise<string> {
+    // Vers une base synchronisée, oui : sa colonne miroir est calculée, rien ne s'écrit dans ses lignes.
+    this.refuserSiSynchronisee(base)
+    const schema = this.schema(base)
+    const schemaCible = this.schema(cible)
+    const nomPropre = nom.trim() || schemaCible.nom
+    const cle = cleColonne(nomPropre, schema.colonnes.map((c) => c.cle))
+    const auto = cible === base
+    const miroir = nomMiroir?.trim() || (auto ? `${nomPropre} (inverse)` : schema.nom)
+    const cleMiroir = cleColonne(miroir, [...schemaCible.colonnes.map((c) => c.cle), ...(auto ? [cle] : [])])
+    await this.modifierSchema(base, {
+      type: 'ajouter_colonne',
+      colonne: { cle, nom: nomPropre, type: 'relation', cible, proprietaire: true, inverse: cleMiroir },
+    })
+    await this.modifierSchema(cible, {
+      type: 'ajouter_colonne',
+      colonne: { cle: cleMiroir, nom: miroir, type: 'relation', cible: base, proprietaire: false, inverse: cle },
+    })
+    return cle
+  }
+
+  /**
+   * Relation créée à la volée (spec §9 « Base des tâches ») : comme
+   * `ajouterRelation`, puis ses deux colonnes masquées dans toutes les vues
+   * existantes des deux bases, et « masqué si vide » dans leurs mises en page,
+   * pour que l'affichage choisi ne change pas. Rend les clés des deux colonnes.
+   */
+  ajouterRelationDiscrete(base: string, nom: string, cible: string, nomMiroir?: string): Promise<{ cle: string; miroir: string }> {
+    return this.enFile(async () => {
+      const cle = await this.ajouterRelationSansFile(base, nom, cible, nomMiroir)
+      const miroir = (colonne(this.schema(base), cle) as ColonneRelation).inverse
+      const ajouts: [string, string][] = [[base, cle], [cible, miroir]]
+      for (const b of new Set([base, cible])) {
+        const cles = ajouts.filter(([x]) => x === b).map(([, k]) => k)
+        const etat = this.bases.get(b)
+        for (const v of etat?.vues ?? []) await this.ecrireVue(b, v.id, { masquees: [...new Set([...(v.masquees ?? []), ...cles])] })
+        for (const m of etat?.pages ?? []) {
+          const modifs = { champs: [...m.champs.filter((c) => !cles.includes(c.cle)), ...cles.map((k) => ({ cle: k, affichage: 'masque_si_vide' as const }))] }
+          this.remplacerPages(b, (pages) => pages.map((x) => (x.id === m.id ? avecModifs(x, modifs) : x)))
+          await this.ecrireMiseEnPage(b, m.id, modifs)
+        }
+      }
+      return { cle, miroir }
+    })
+  }
+
+  /** Crée un rollup ; refusé s'il créerait une boucle de dépendances (invariant 7). */
+  ajouterRollup(base: string, nom: string, relation: string, champ: string, calcul: Calcul): Promise<string> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      const schema = this.schema(base)
+      const rel = colonne(schema, relation)
+      if (rel?.type !== 'relation') throw new ErreurSchema(`Pas une relation : ${relation}`)
+      if (!colonne(this.schema(rel.cible), champ)) throw new ErreurSchema(`Colonne introuvable : ${champ}`)
+      if (!(CALCULS as readonly string[]).includes(calcul)) throw new ErreurSchema(`Calcul inconnu : ${calcul}`)
+      const cle = cleColonne(nom, schema.colonnes.map((c) => c.cle))
+      const nouvelle: Colonne = { cle, nom: nom.trim() || cle, type: 'rollup', relation, champ, calcul }
+      const schemas = new Map(this.schemas())
+      schemas.set(base, { ...schema, colonnes: [...schema.colonnes, nouvelle] })
+      const b = boucle(schemas)
+      if (b) throw new ErreurSchema(`Rollup refusé. ${b}`)
+      await this.modifierSchema(base, { type: 'ajouter_colonne', colonne: nouvelle })
+      return cle
+    })
+  }
+
+  /** Change la colonne titre, puis renomme les fichiers selon le nouveau titre (spec §3). */
+  changerTitre(base: string, cle: string): Promise<void> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      const c = colonne(this.schema(base), cle)
+      if (c?.type !== 'text') throw new ErreurSchema('Seule une colonne texte peut servir de titre')
+      await this.modifierSchema(base, { type: 'champ_titre', cle })
+      await this.depot(base).renommerTousSelonTitre()
+    })
+  }
+
+  /** Ajoute une option à un select ou multiselect, ou renvoie celle qui porte déjà ce libellé. */
+  ajouterOption(base: string, cle: string, label: string): Promise<Option> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      const c = colonne(this.schema(base), cle)
+      if (c?.type !== 'select' && c?.type !== 'multiselect') throw new ErreurSchema(`Pas une colonne à options : ${cle}`)
+      const existante = c.options.find((o) => o.label === label)
+      if (existante) return existante
+      const option = { label, couleur: COULEURS[c.options.length % COULEURS.length]! }
+      await this.modifierSchema(base, { type: 'ajouter_option', cle, option })
+      return option
+    })
+  }
+
+  /** Couleur d'une option : ne modifie que `_schema.yaml`, et vaut partout où l'option s'affiche. */
+  changerCouleurOption(base: string, cle: string, label: string, couleur: string): Promise<void> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      if (!(COULEURS as readonly string[]).includes(couleur)) throw new ErreurSchema(`Couleur inconnue : ${couleur}`)
+      await this.modifierSchema(base, { type: 'couleur_option', cle, label, couleur })
+    })
+  }
+
+  /**
+   * Retire une option (spec §3) : les lignes qui l'ont prennent `remplacement`,
+   * ou perdent la valeur. Lignes réécrites d'abord, hors annulation, puis le
+   * schéma. Renvoie le nombre de lignes réécrites.
+   */
+  retirerOption(base: string, cle: string, label: string, remplacement?: string): Promise<number> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      const c = colonne(this.schema(base), cle)
+      if (c?.type !== 'select' && c?.type !== 'multiselect') throw new ErreurSchema(`Pas une colonne à options : ${cle}`)
+      if (!c.options.some((o) => o.label === label)) throw new ErreurSchema(`Option introuvable : ${label}`)
+      if (remplacement !== undefined && (remplacement === label || !c.options.some((o) => o.label === remplacement))) throw new ErreurSchema(`Option de remplacement introuvable : ${remplacement}`)
+      const changements = new Map<string, Valeur | undefined>()
+      for (const l of this.depot(base).lignes()) {
+        const v = l.cellules[cle]
+        if (v?.etat !== 'ok') continue
+        if (c.type === 'select') {
+          if (v.valeur === label) changements.set(l.id, remplacement)
+        } else if (Array.isArray(v.valeur) && v.valeur.includes(label)) {
+          const suivants = [...new Set(v.valeur.map((x) => (x === label ? remplacement : x)).filter((x): x is string => typeof x === 'string'))]
+          changements.set(l.id, suivants.length > 0 ? suivants : undefined)
+        }
+      }
+      const n = await this.depot(base).remplacerValeurs(cle, changements)
+      await this.modifierSchema(base, { type: 'retirer_option', cle, label })
+      return n
+    })
+  }
+
+  /** Change la relation, la colonne remontée ou le calcul d'un rollup ; refusé s'il créerait une boucle. */
+  modifierRollup(base: string, cle: string, modifs: { relation?: string; champ?: string; calcul?: Calcul }): Promise<void> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      const schema = this.schema(base)
+      const actuel = colonne(schema, cle)
+      if (actuel?.type !== 'rollup') throw new ErreurSchema(`Pas un rollup : ${cle}`)
+      const suivant = { ...actuel, ...modifs }
+      const rel = colonne(schema, suivant.relation)
+      if (rel?.type !== 'relation') throw new ErreurSchema(`Pas une relation : ${suivant.relation}`)
+      if (!colonne(this.schema(rel.cible), suivant.champ)) throw new ErreurSchema(`Colonne introuvable : ${suivant.champ}`)
+      if (!(CALCULS as readonly string[]).includes(suivant.calcul)) throw new ErreurSchema(`Calcul inconnu : ${suivant.calcul}`)
+      const schemas = new Map(this.schemas())
+      schemas.set(base, { ...schema, colonnes: schema.colonnes.map((c) => (c.cle === cle ? suivant : c)) })
+      const b = boucle(schemas)
+      if (b) throw new ErreurSchema(`Modification refusée. ${b}`)
+      const proprietes: Record<string, unknown> = { ...modifs }
+      if (modifs.relation !== undefined && modifs.relation !== actuel.relation) {
+        // Le filtre portait sur les lignes de l'ancienne base liée : il n'a plus de sens.
+        proprietes.filtre = undefined
+      } else if (modifs.champ !== undefined && modifs.champ !== actuel.champ && estObjet(actuel.filtre) && actuel.filtre.colonne === undefined) {
+        // Un filtre sans colonne porte sur la colonne remontée : on le fixe sur l'ancienne pour qu'il garde son sens.
+        proprietes.filtre = { colonne: actuel.champ, ...actuel.filtre }
+      }
+      await this.modifierSchema(base, { type: 'modifier_colonne', cle, proprietes })
+    })
+  }
+
+  /**
+   * Crée une formule (spec §6) à partir de son expression stockée (clés). Refusée
+   * si elle ne se compile pas ou créerait une boucle (invariant 7).
+   */
+  ajouterFormule(base: string, nom: string, expression: string): Promise<string> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      const schema = this.schema(base)
+      const cle = cleColonne(nom, schema.colonnes.map((c) => c.cle))
+      const nouvelle: Colonne = { cle, nom: nom.trim() || cle, type: 'formula', expression }
+      this.verifierFormule(base, nouvelle)
+      await this.modifierSchema(base, { type: 'ajouter_colonne', colonne: nouvelle })
+      return cle
+    })
+  }
+
+  modifierFormule(base: string, cle: string, expression: string): Promise<void> {
+    return this.enFile(async () => {
+      this.refuserSiSynchronisee(base)
+      const actuelle = colonne(this.schema(base), cle)
+      if (actuelle?.type !== 'formula') throw new ErreurSchema(`Pas une formule : ${cle}`)
+      if (actuelle.expression === expression) return
+      this.verifierFormule(base, { ...actuelle, expression })
+      await this.modifierSchema(base, { type: 'modifier_colonne', cle, proprietes: { expression } })
+    })
+  }
+
+  private verifierFormule(base: string, formule: Extract<Colonne, { type: 'formula' }>) {
+    const probleme = this.problemeFormule(base, formule)
+    if (probleme) throw new ErreurSchema(`Formule refusée : ${probleme}`)
+  }
+
+  /**
+   * Ce qui empêcherait d'enregistrer cette expression (stockée, avec les clés) :
+   * erreur de syntaxe ou de type, ou boucle. `null` si elle est acceptable.
+   * `cle` : la formule modifiée, absente pour une nouvelle.
+   */
+  essayerFormule(base: string, cle: string | null, expression: string): string | null {
+    return this.problemeFormule(base, { cle: cle ?? '\u0000nouvelle', nom: 'Nouvelle formule', type: 'formula', expression })
+  }
+
+  private problemeFormule(base: string, formule: Extract<Colonne, { type: 'formula' }>): string | null {
+    const schema = this.schema(base)
+    const colonnes = schema.colonnes.some((c) => c.cle === formule.cle)
+      ? schema.colonnes.map((c) => (c.cle === formule.cle ? formule : c))
+      : [...schema.colonnes, formule]
+    const schemas = new Map(this.schemas())
+    schemas.set(base, { ...schema, colonnes })
+    const b = boucle(schemas)
+    if (b) return b
+    try {
+      compiler(formule.expression, (cle) => colonnes.find((c) => c.cle === cle))
+    } catch (e) {
+      if (e instanceof ErreurFormule) return e.message
+      throw e
+    }
+    return null
+  }
+
+  /** Recherche globale (spec §11) : titres, champs texte et corps de toutes les bases. */
+  chercher(requete: string, limite?: number): Resultat[] {
+    return this.recherche.chercher(requete, limite)
+  }
+
+  /** Lignes proches d'une demande en langage libre (assistant IA). */
+  candidats(texte: string, limite?: number): { base: string; ligne: string }[] {
+    return this.recherche.candidats(texte, limite)
+  }
+
+  /** Recalcule les colonnes calculées : au changement de jour, pour `aujourdhui()` (spec §6). */
+  recalculer(): void {
+    this.publier()
+  }
+
+  // ── Lignes et liens ──────────────────────────────────────────────
+
+  /**
+   * Remplace les liens d'une relation pour une ligne (spec §5). Côté
+   * propriétaire : son propre fichier. Côté non propriétaire : chaque lien
+   * ajouté ou retiré s'écrit dans le fichier de la ligne liée, un seul
+   * fichier par lien (invariant 2).
+   */
+  modifierRelation(base: string, idLigne: string, cle: string, ids: readonly string[]): void {
+    this.enUneEtape(() => this.modifierRelationSansEtape(base, idLigne, cle, ids))
+  }
+
+  private modifierRelationSansEtape(base: string, idLigne: string, cle: string, ids: readonly string[]): void {
+    const c = colonne(this.schema(base), cle)
+    if (c?.type !== 'relation') throw new ErreurSchema(`Pas une relation : ${cle}`)
+    const ligne = this.ligne(base, idLigne)
+    // Auto-relation : une ligne ne se lie jamais à elle-même.
+    if (c.cible === base) ids = ids.filter((id) => id !== idLigne)
+    if (c.proprietaire) {
+      this.depot(base).modifier(ligne.chemin, cle, [...ids])
+      return
+    }
+    const actuels = this.idsCalcules(base, idLigne, cle)
+    const depotCible = this.depot(c.cible)
+    const basculer = (idCible: string, lier: boolean) => {
+      const cibleLigne = this.ligne(c.cible, idCible)
+      const cellule = cibleLigne.cellules[c.inverse]
+      const liens = cellule?.etat === 'ok' && Array.isArray(cellule.valeur) ? cellule.valeur : []
+      const suivants = lier ? [...liens.filter((x) => x !== idLigne), idLigne] : liens.filter((x) => x !== idLigne)
+      depotCible.modifier(cibleLigne.chemin, c.inverse, suivants)
+    }
+    for (const id of ids) if (!actuels.includes(id)) basculer(id, true)
+    for (const id of actuels) if (!ids.includes(id)) basculer(id, false)
+  }
+
+  /** Liens (côté propriétaire, dans les autres bases) qui pointent vers une ligne. */
+  liensVers(base: string, id: string): LienVers[] {
+    const liens: LienVers[] = []
+    for (const b of this.bases.values()) {
+      if (!b.depot) continue
+      const relations = b.depot.schema.colonnes.filter((c): c is ColonneRelation => c.type === 'relation' && c.proprietaire && c.cible === base)
+      for (const l of b.depot.lignes()) {
+        for (const c of relations) if (idsDe(l, c.cle).includes(id)) liens.push({ base: b.id, chemin: l.chemin, cle: c.cle })
+      }
+    }
+    return liens
+  }
+
+  /**
+   * Supprime une ligne (son fichier). Les liens qui pointaient vers elle
+   * deviennent des liens cassés, sauf si `nettoyer` : ils sont alors retirés
+   * des fichiers qui les portent (spec §5, nettoyage proposé, jamais silencieux).
+   * Si un autre fichier porte le même id, les liens restent : ils pointent vers lui.
+   */
+  supprimerLigne(base: string, chemin: string, nettoyer: boolean): Promise<void> {
+    return this.enUneEtape(() => this.supprimerLigneSansEtape(base, chemin, nettoyer))
+  }
+
+  private async supprimerLigneSansEtape(base: string, chemin: string, nettoyer: boolean): Promise<void> {
+    const depot = this.depot(base)
+    const ligne = depot.lignes().find((l) => l.chemin === chemin)
+    if (!ligne) throw new ErreurSchema(`Ligne introuvable : ${chemin}`)
+    const encoreLa = depot.lignes().some((l) => l.id === ligne.id && l.chemin !== chemin)
+    if (nettoyer && !encoreLa) {
+      for (const lien of this.liensVers(base, ligne.id)) {
+        const d = this.depot(lien.base)
+        const l = d.lignes().find((x) => x.chemin === lien.chemin)!
+        d.modifier(lien.chemin, lien.cle, idsDe(l, lien.cle).filter((x) => x !== ligne.id))
+      }
+    }
+    await depot.supprimer(chemin)
+  }
+
+  /** Supprime plusieurs lignes d'une base (sélection du tableau), une par une, mêmes règles que `supprimerLigne`. */
+  supprimerLignes(base: string, chemins: readonly string[], nettoyer: boolean): Promise<void> {
+    return this.enUneEtape(async () => {
+      for (const chemin of chemins) await this.supprimerLigne(base, chemin, nettoyer)
+    })
+  }
+
+  /**
+   * Donne la même valeur à une colonne de plusieurs lignes (modification en
+   * lot, recopie d'une cellule vers le haut ou le bas). Une relation passe par
+   * `modifierRelation` (côté non propriétaire compris) ; le titre renomme les fichiers.
+   */
+  modifierLignes(base: string, chemins: readonly string[], cle: string, valeur: Valeur | undefined): Promise<void> {
+    return this.enUneEtape(() => this.modifierLignesSansEtape(base, chemins, cle, valeur))
+  }
+
+  private async modifierLignesSansEtape(base: string, chemins: readonly string[], cle: string, valeur: Valeur | undefined): Promise<void> {
+    const depot = this.depot(base)
+    const c = colonne(depot.schema, cle)
+    if (!c || (!estSaisie(c) && c.type !== 'relation')) throw new ErreurSchema(`Colonne non modifiable : ${cle}`)
+    const lignes = chemins.flatMap((ch) => depot.lignes().find((l) => l.chemin === ch) ?? [])
+    for (const l of lignes) {
+      if (c.type === 'relation') this.modifierRelation(base, l.id, cle, Array.isArray(valeur) ? valeur.map(String) : [])
+      else depot.modifier(l.chemin, cle, valeur)
+    }
+    if (cle === depot.schema.champTitre) for (const l of lignes) await depot.renommerSelonTitre(l.chemin)
+  }
+
+  /**
+   * Remplace une ligne par des morceaux (une affectation coupée autour d'un
+   * jour, spec §21) : le premier réécrit la ligne, les suivants sont des copies
+   * de ses valeurs saisies avec leurs propres valeurs ; aucun morceau la
+   * supprime. Une seule étape d'annulation.
+   */
+  decouperLigne(base: string, chemin: string, morceaux: readonly Modifications[]): Promise<void> {
+    return this.enUneEtape(async () => {
+      const depot = this.depot(base)
+      const l = depot.lignes().find((x) => x.chemin === chemin)
+      if (!l) return
+      const [premier, ...suite] = morceaux
+      if (!premier) return this.supprimerLigneSansEtape(base, chemin, true)
+      const valeurs: Modifications = {}
+      for (const c of depot.schema.colonnes) {
+        const v = l.cellules[c.cle]
+        if (estSaisie(c) && v?.etat === 'ok') valeurs[c.cle] = v.valeur
+      }
+      for (const m of suite) await depot.creer({ ...valeurs, ...m })
+      for (const [cle, v] of Object.entries(premier)) depot.modifier(chemin, cle, v)
+    })
+  }
+
+  /**
+   * Duplique des lignes : valeurs saisies (liens côté propriétaire compris) et
+   * corps, dans un nouveau fichier avec un nouvel id. Les liens portés par
+   * l'autre base ne sont pas recopiés : ce serait écrire dans ses fichiers.
+   */
+  dupliquerLignes(base: string, chemins: readonly string[]): Promise<LigneChargee[]> {
+    return this.enUneEtape(() => this.dupliquerSansEtape(base, chemins))
+  }
+
+  private async dupliquerSansEtape(base: string, chemins: readonly string[]): Promise<LigneChargee[]> {
+    const depot = this.depot(base)
+    const copies: LigneChargee[] = []
+    for (const chemin of chemins) {
+      const l = depot.lignes().find((x) => x.chemin === chemin)
+      if (!l) continue
+      const valeurs: Modifications = {}
+      for (const c of depot.schema.colonnes) {
+        const v = l.cellules[c.cle]
+        if (estSaisie(c) && v?.etat === 'ok') valeurs[c.cle] = v.valeur
+      }
+      const copie = await depot.creer(valeurs)
+      if (l.corps.trim() !== '') depot.modifierCorps(copie.chemin, l.corps)
+      copies.push(copie)
+    }
+    return copies
+  }
+
+  /** Lignes d'une relation (côté propriétaire) qui portent des liens cassés, et ces ids. */
+  liensCasses(base: string, cle: string): { chemin: string; ids: string[] }[] {
+    const c = colonne(this.schema(base), cle)
+    if (c?.type !== 'relation' || !c.proprietaire) return []
+    const existants = this.instantane.titres.get(c.cible)
+    return this.depot(base)
+      .lignes()
+      .map((l) => ({ chemin: l.chemin, ids: idsDe(l, cle).filter((id) => !existants?.has(id)) }))
+      .filter((x) => x.ids.length > 0)
+  }
+
+  /** Retire les liens cassés d'une relation dans toutes les lignes ; renvoie le nombre de liens retirés. */
+  nettoyerLiensCasses(base: string, cle: string): number {
+    return this.enUneEtape(() => this.nettoyerLiensCassesSansEtape(base, cle))
+  }
+
+  private nettoyerLiensCassesSansEtape(base: string, cle: string): number {
+    const depot = this.depot(base)
+    let n = 0
+    for (const { chemin, ids } of this.liensCasses(base, cle)) {
+      const l = depot.lignes().find((x) => x.chemin === chemin)!
+      depot.modifier(chemin, cle, idsDe(l, cle).filter((id) => !ids.includes(id)))
+      n += ids.length
+    }
+    return n
+  }
+
+  /**
+   * Crée une ligne (spec §8). Les valeurs d'une relation non propriétaire
+   * (héritées d'un filtre « contient ») s'écrivent dans les lignes liées.
+   */
+  creerLigne(base: string, valeurs: Modifications = {}): Promise<LigneChargee> {
+    return this.enUneEtape(() => this.creerLigneSansEtape(base, valeurs))
+  }
+
+  private async creerLigneSansEtape(base: string, valeurs: Modifications = {}): Promise<LigneChargee> {
+    const schema = this.schema(base)
+    const saisies: Modifications = {}
+    const liens: [string, string[]][] = []
+    for (const [cle, v] of Object.entries(valeurs)) {
+      const c = colonne(schema, cle)
+      if (!c) continue
+      if (estSaisie(c)) saisies[cle] = v
+      else if (c.type === 'relation' && Array.isArray(v)) liens.push([cle, v])
+    }
+    const ligne = await this.depot(base).creer(saisies)
+    for (const [cle, ids] of liens) this.modifierRelation(base, ligne.id, cle, ids)
+    return ligne
+  }
+
+  // ── Import CSV ───────────────────────────────────────────────────
+
+  /**
+   * Nouvelle base depuis un CSV : la première colonne devient le titre, les
+   * autres sont créées avec le type choisi, puis une ligne par enregistrement.
+   */
+  async importerBase(nom: string, colonnes: readonly ColonneImportee[], lignes: readonly string[][], groupe: string | null = null): Promise<string> {
+    const base = await this.creerBase(nom, groupe)
+    const [titre, ...autres] = colonnes
+    const cles: string[] = [this.schema(base).champTitre]
+    if (titre) await this.renommerColonne(base, cles[0]!, titre.nom)
+    for (const c of autres) cles.push(await this.ajouterColonne(base, c.nom, c.type))
+    await this.importerLignes(base, cles, lignes)
+    return base
+  }
+
+  /**
+   * Colonne de la base qui reçoit chaque colonne du CSV : même nom, sans tenir
+   * compte de la casse ni des accents. `null` si aucune, ou si la colonne n'est
+   * pas saisissable à la main (relation, rollup, formule).
+   */
+  correspondances(base: string, entetes: readonly string[]): (string | null)[] {
+    const norme = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').trim().toLowerCase()
+    const colonnes = this.schema(base).colonnes.filter((c) => (TYPES_CREABLES as readonly string[]).includes(c.type))
+    return entetes.map((e) => colonnes.find((c) => norme(c.nom) === norme(e))?.cle ?? null)
+  }
+
+  /**
+   * Tableau collé dans une base : si sa première ligne nomme au moins une
+   * colonne saisissable, c'est une ligne d'en-têtes (retrouvées comme à
+   * l'import) ; sinon chaque valeur va dans la colonne affichée à la même
+   * place (`ordre`), `null` pour une colonne qu'on ne remplit pas à la main.
+   */
+  preparerCollage(base: string, grille: readonly string[][], ordre: readonly string[]): { entetes: string[]; cles: (string | null)[]; lignes: string[][] } {
+    const [premiere = [], ...suite] = grille
+    const trouvees = this.correspondances(base, premiere)
+    if (trouvees.some((c) => c !== null)) return { entetes: [...premiere], cles: trouvees, lignes: suite.map((l) => [...l]) }
+    const schema = this.schema(base)
+    const largeur = Math.max(0, ...grille.map((l) => l.length))
+    const cibles = Array.from({ length: largeur }, (_, i) => (ordre[i] ? colonne(schema, ordre[i]) : undefined))
+    return {
+      entetes: cibles.map((c, i) => c?.nom ?? `Colonne ${i + 1}`),
+      cles: cibles.map((c) => (c && (TYPES_CREABLES as readonly string[]).includes(c.type) ? c.cle : null)),
+      lignes: grille.map((l) => [...l]),
+    }
+  }
+
+  /**
+   * Tableau collé sur des cellules (spec §7, « Coller ») : ce qui sera
+   * remplacé, à partir de la case en haut à gauche de la zone choisie.
+   * `lignes` et `colonnes` vont de cette case jusqu'au bout de la vue ; une
+   * valeur seule collée sur une zone plus grande la remplit toute. Les lignes
+   * collées au-delà de la dernière deviennent des lignes nouvelles.
+   */
+  preparerRemplacement(
+    base: string,
+    cible: { lignes: readonly string[]; colonnes: readonly string[]; hauteur: number; largeur: number },
+    grille: readonly string[][],
+  ): Remplacement {
+    const r: Remplacement = { modifs: [], nouvelles: [], options: [], ignorees: 0, lignes: 0 }
+    const seule = grille.length === 1 && grille[0]!.length === 1 && cible.hauteur * cible.largeur > 1
+    const valeurs = seule ? Array.from({ length: cible.hauteur }, () => Array<string>(cible.largeur).fill(grille[0]![0]!)) : grille
+    const touchees = new Set<string>()
+    for (const [i, rangee] of valeurs.entries()) {
+      const chemin = cible.lignes[i]
+      const nouvelle: Modifications = {}
+      for (const [j, brut] of rangee.entries()) {
+        const cle = cible.colonnes[j]
+        const lu = cle === undefined ? null : this.lireSaisie(base, cle, brut)
+        if (!lu) {
+          r.ignorees++
+          continue
+        }
+        for (const label of lu.options) if (!r.options.some((o) => o.cle === cle && o.label === label)) r.options.push({ cle: cle!, label })
+        if (chemin) {
+          r.modifs.push({ chemin, cle: cle!, valeur: lu.valeur })
+          touchees.add(chemin)
+        } else if (lu.valeur !== undefined) nouvelle[cle!] = lu.valeur
+      }
+      if (!chemin && Object.keys(nouvelle).length > 0) r.nouvelles.push(nouvelle)
+    }
+    r.lignes = touchees.size
+    return r
+  }
+
+  /** Écrit un remplacement préparé : options manquantes, cellules, lignes nouvelles ; un seul Ctrl+Z le défait. */
+  appliquerRemplacement(base: string, r: Remplacement): Promise<void> {
+    return this.enUneEtape(async () => {
+      for (const o of r.options) await this.ajouterOption(base, o.cle, o.label)
+      for (const m of r.modifs) await this.modifierLignesSansEtape(base, [m.chemin], m.cle, m.valeur)
+      for (const v of r.nouvelles) await this.creerLigneSansEtape(base, v)
+    })
+  }
+
+  /**
+   * Valeur d'une colonne lue depuis un texte collé ; `null` si la colonne ne
+   * se saisit pas (rollup, formule) ou si le texte est illisible pour son type.
+   * Une relation se lit par titres (ou ids) de la base liée, séparés par des virgules.
+   */
+  private lireSaisie(base: string, cle: string, brut: string): { valeur: Valeur | undefined; options: string[] } | null {
+    const c = colonne(this.schema(base), cle)
+    if (!c || c.type === 'rollup' || c.type === 'formula') return null
+    const texte = brut.trim()
+    if (texte === '') return { valeur: undefined, options: [] }
+    if (c.type === 'relation') {
+      const titres = this.instantane.titres.get(c.cible) ?? new Map<string, string>()
+      const norme = (x: string) => x.normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase()
+      const ids: string[] = []
+      for (const morceau of texte.split(/\s*[,;]\s*/).filter((x) => x !== '')) {
+        const id = titres.has(morceau) ? morceau : [...titres].find(([, t]) => norme(t) === norme(morceau))?.[0]
+        if (!id) return null
+        if (!ids.includes(id)) ids.push(id)
+      }
+      return { valeur: ids, options: [] }
+    }
+    if (c.type === 'select' || c.type === 'multiselect') {
+      const labels = (c.type === 'select' ? [texte] : texte.split(/\s*[,;]\s*/).filter((x) => x !== '')).map(
+        (l) => c.options.find((o) => o.label.toLowerCase() === l.toLowerCase())?.label ?? l,
+      )
+      return { valeur: c.type === 'select' ? labels[0] : labels, options: labels.filter((l) => !c.options.some((o) => o.label === l)) }
+    }
+    const valeur = convertirValeur(c.type as TypeCreable, texte)
+    if (valeur === undefined && c.type !== 'checkbox') return null
+    return { valeur, options: [] }
+  }
+
+  /**
+   * Ajoute une ligne par enregistrement ; `cles[i]` est la colonne qui reçoit
+   * la i-ème valeur (`null` : ignorée). Les options de sélection absentes sont
+   * créées d'abord. Une valeur illisible pour le type de sa colonne est laissée vide.
+   */
+  importerLignes(base: string, cles: readonly (string | null)[], lignes: readonly string[][]): Promise<number> {
+    return this.enUneEtape(() => this.importerLignesSansEtape(base, cles, lignes))
+  }
+
+  private async importerLignesSansEtape(base: string, cles: readonly (string | null)[], lignes: readonly string[][]): Promise<number> {
+    const cibles = cles.map((cle) => {
+      const c = cle === null ? undefined : colonne(this.schema(base), cle)
+      return c && (TYPES_CREABLES as readonly string[]).includes(c.type) ? { cle: c.cle, type: c.type as TypeCreable } : null
+    })
+    for (const [i, cible] of cibles.entries()) {
+      if (cible?.type !== 'select' && cible?.type !== 'multiselect') continue
+      const labels = new Set(lignes.flatMap((l) => [convertirValeur(cible.type, l[i] ?? '')].flat()).filter((v): v is string => typeof v === 'string'))
+      for (const label of labels) await this.ajouterOption(base, cible.cle, label)
+    }
+    for (const l of lignes) {
+      const valeurs: Modifications = {}
+      for (const [i, cible] of cibles.entries()) {
+        if (!cible) continue
+        const v = convertirValeur(cible.type, l[i] ?? '')
+        if (v !== undefined) valeurs[cible.cle] = v
+      }
+      await this.creerLigne(base, valeurs)
+    }
+    return lignes.length
+  }
+
+  // ── Annuler / rétablir ───────────────────────────────────────────
+
+  private noter(c: Changement) {
+    this.historique.noter(c)
+    if (c.type !== 'cellule' && c.type !== 'corps') return
+    this.arreterFrappe?.()
+    this.arreterFrappe = this.options.planifier(() => this.historique.fermer(), PAUSE_FRAPPE)
+  }
+
+  /** Exécute `action` : tout ce qu'elle change dans les données s'annule d'un seul Ctrl+Z. */
+  enUneEtape<T>(action: () => T): T {
+    return this.historique.groupe(action)
+  }
+
+  /** Ce que chaque action groupée, annulation ou rétablissement vient de changer (pour le montrer). */
+  ecouterEtapes = (fn: (changements: readonly Changement[]) => void): (() => void) => this.historique.ecouter(fn)
+
+  peutAnnuler = (): boolean => this.historique.peutAnnuler()
+  peutRetablir = (): boolean => this.historique.peutRetablir()
+
+  /** Défait la dernière étape ; `false` s'il n'y a rien à annuler. */
+  annuler(): Promise<boolean> {
+    return this.historique.annuler((c) => this.inverser(c))
+  }
+
+  retablir(): Promise<boolean> {
+    return this.historique.retablir((c) => this.inverser(c))
+  }
+
+  /**
+   * Défait un changement. Ce qui ne peut plus l'être (base ou colonne
+   * supprimée depuis, ligne disparue) est laissé tel quel, sans bloquer le reste.
+   */
+  private async inverser(c: Changement): Promise<void> {
+    const depot = this.bases.get(c.base)?.depot
+    if (!depot) return
+    const ligne = depot.lignes().find((l) => l.id === c.id)
+    try {
+      if (c.type === 'cellule') {
+        const col = colonne(depot.schema, c.cle)
+        if (!ligne || !col || !estSaisie(col)) return
+        depot.modifier(ligne.chemin, c.cle, c.avant)
+        if (c.cle === depot.schema.champTitre) await depot.renommerSelonTitre(ligne.chemin)
+      } else if (c.type === 'corps') {
+        if (ligne) depot.modifierCorps(ligne.chemin, c.avant)
+      } else if (c.type === 'creee') {
+        if (ligne) await depot.supprimer(ligne.chemin)
+      } else if (!ligne) {
+        await depot.restaurer(c.chemin, c.source, c.enAttente)
+      }
+    } catch (x) {
+      if (!(x instanceof ErreurSchema) && !(x instanceof ErreurEcriture)) throw x
+    }
+  }
+
+  // ── Vues ─────────────────────────────────────────────────────────
+
+  /**
+   * Modifie une vue : l'état en mémoire change tout de suite (deux modifications
+   * rapides partent ainsi de la bonne base), le fichier suit. La vue implicite
+   * d'une base obtient alors son fichier.
+   */
+  modifierVue(base: string, idVue: string, modifs: ModificationVue): Promise<void> {
+    this.vue(base, idVue)
+    this.remplacerVues(base, (vues) => vues.map((v) => (v.id === idVue ? { ...v, ...modifs } : v)))
+    return this.apresMemoire(() => this.ecrireVueEnMemoire(base, idVue, modifs))
+  }
+
+  /** Applique en mémoire puis écrit, depuis une opération déjà dans la file. */
+  private async ecrireVue(base: string, idVue: string, modifs: ModificationVue): Promise<void> {
+    this.remplacerVues(base, (vues) => vues.map((v) => (v.id === idVue ? { ...v, ...modifs } : v)))
+    await this.ecrireVueEnMemoire(base, idVue, modifs)
+  }
+
+  /** Écrit une modification de vue déjà appliquée en mémoire. */
+  private async ecrireVueEnMemoire(base: string, idVue: string, modifs: ModificationVue): Promise<void> {
+    const vue = this.vue(base, idVue)
+    const chemin = cheminVue(base, idVue)
+    const texte = modifierVue(vue.implicite ? null : await this.lireOuNull(chemin), vue, modifs)
+    await this.adaptateur.ecrire(chemin, texte)
+    const relue = lireVue(texte, idVue).vue
+    if (relue) this.remplacerVues(base, (vues) => vues.map((v) => (v.id === idVue ? { ...relue, ...enAttente(v, relue) } : v)))
+  }
+
+  creerVue(base: string, nom: string, type: TypeVue = 'tableau', reglages: ModificationVue = {}): Promise<string> {
+    return this.enFile(async () => {
+      const vues = this.etatBase(base).vues
+      const id = idBase(nom, vues.map((v) => v.id))
+      const vue: Vue = { ...vueParDefaut(), ...reglages, id, nom: nom.trim() || id, type }
+      delete vue.implicite
+      await this.adaptateur.ecrire(cheminVue(base, id), modifierVue(null, vue, reglages))
+      // La vue implicite n'a pas de fichier : la garder ferait croire qu'elle existe encore.
+      const suivantes = [...vues.filter((v) => !v.implicite), vue]
+      this.remplacerVues(base, () => suivantes)
+      // La nouvelle vue prend le dernier onglet, y compris après un rechargement.
+      await this.modifierSchema(base, { type: 'ordre_vues', ids: suivantes.map((v) => v.id) })
+      return id
+    })
+  }
+
+  supprimerVue(base: string, idVue: string): Promise<void> {
+    return this.enFile(async () => {
+      const vues = this.etatBase(base).vues
+      if (vues.length <= 1) throw new ErreurSchema('Une base garde toujours au moins une vue')
+      if (!this.vue(base, idVue).implicite) await this.adaptateur.supprimer(cheminVue(base, idVue))
+      this.remplacerVues(base, (vs) => vs.filter((v) => v.id !== idVue))
+      const ordre = this.schema(base).ordreVues
+      if (ordre.includes(idVue)) await this.modifierSchema(base, { type: 'ordre_vues', ids: ordre.filter((x) => x !== idVue) })
+    })
+  }
+
+  /** Réordonne les onglets de vues ; l'ordre est gardé dans `_schema.yaml` (clé `vues`). */
+  ordonnerVues(base: string, ids: string[]): Promise<void> {
+    const vues = this.etatBase(base).vues
+    const parId = new Map(vues.map((v) => [v.id, v]))
+    const ordonnees = [...ids.flatMap((id) => parId.get(id) ?? []), ...vues.filter((v) => !ids.includes(v.id))]
+    this.remplacerVues(base, () => ordonnees)
+    return this.apresMemoire(() =>
+      this.modifierSchema(base, { type: 'ordre_vues', ids: ordonnees.filter((v) => !v.implicite).map((v) => v.id) }),
+    )
+  }
+
+  // ── Mises en page ────────────────────────────────────────────────
+
+  /**
+   * Modifie une mise en page (en mémoire tout de suite, puis le fichier).
+   * La marquer par défaut retire ce statut aux autres.
+   */
+  modifierMiseEnPage(base: string, id: string, modifs: ModificationMiseEnPage): Promise<void> {
+    this.page(base, id)
+    const anciennesParDefaut = modifs.defaut ? this.etatBase(base).pages.filter((p) => p.id !== id && p.defaut) : []
+    this.remplacerPages(base, (pages) =>
+      pages.map((p) => (p.id === id ? avecModifs(p, modifs) : modifs.defaut ? { ...p, defaut: false } : p)),
+    )
+    return this.apresMemoire(async () => {
+      await this.ecrireMiseEnPage(base, id, modifs)
+      for (const p of anciennesParDefaut) if (!p.implicite) await this.ecrireMiseEnPage(base, p.id, { defaut: false })
+    })
+  }
+
+  /** Crée une mise en page, en partant des réglages d'une existante. */
+  creerMiseEnPage(base: string, nom: string, depuis?: string): Promise<string> {
+    return this.enFile(async () => {
+      const pages = this.etatBase(base).pages
+      const modele = pages.find((p) => p.id === depuis)
+      const id = idBase(nom, pages.map((p) => p.id))
+      const contenus = modele?.contenus
+      const nouvelle: MiseEnPage = { id, nom: nom.trim() || id, defaut: false, champs: modele?.champs ?? [], onglets: modele?.onglets ?? [], ...(contenus && { contenus }) }
+      await this.adaptateur.ecrire(cheminPage(base, id), modifierMiseEnPage(null, nouvelle, { champs: nouvelle.champs, onglets: nouvelle.onglets, ...(contenus && { contenus }) }))
+      // La mise en page implicite n'a pas de fichier : on l'écrit pour ne pas la perdre.
+      const implicite = pages.find((p) => p.implicite)
+      if (implicite) {
+        await this.adaptateur.ecrire(cheminPage(base, implicite.id), modifierMiseEnPage(null, implicite, {}))
+        delete implicite.implicite
+      }
+      this.remplacerPages(base, (ps) => [...ps.map((p) => ({ ...p })), nouvelle])
+      return id
+    })
+  }
+
+  supprimerMiseEnPage(base: string, id: string): Promise<void> {
+    return this.enFile(async () => {
+      const pages = this.etatBase(base).pages
+      if (pages.length <= 1) throw new ErreurSchema('Une base garde toujours au moins une mise en page')
+      const p = this.page(base, id)
+      if (!p.implicite) await this.adaptateur.supprimer(cheminPage(base, id))
+      this.remplacerPages(base, (ps) => ps.filter((x) => x.id !== id))
+    })
+  }
+
+  // ── Interne ──────────────────────────────────────────────────────
+
+  private page(base: string, id: string): MiseEnPage {
+    const p = this.etatBase(base).pages.find((x) => x.id === id)
+    if (!p) throw new ErreurSchema(`Mise en page introuvable : ${id}`)
+    return p
+  }
+
+  private remplacerPages(base: string, f: (pages: MiseEnPage[]) => MiseEnPage[]) {
+    const b = this.etatBase(base)
+    this.bases.set(base, { ...b, pages: f(b.pages) })
+    this.publier()
+  }
+
+  private async ecrireMiseEnPage(base: string, id: string, modifs: ModificationMiseEnPage) {
+    const p = this.page(base, id)
+    const chemin = cheminPage(base, id)
+    const texte = modifierMiseEnPage(p.implicite ? null : await this.lireOuNull(chemin), p, modifs)
+    await this.adaptateur.ecrire(chemin, texte)
+    if (p.implicite) this.remplacerPages(base, (ps) => ps.map((x) => (x.id === id ? { ...x, implicite: undefined } : x)))
+  }
+
+  private schemas(): Map<string, Schema> {
+    const m = new Map<string, Schema>()
+    for (const b of this.bases.values()) if (b.depot) m.set(b.id, b.depot.schema)
+    return m
+  }
+
+  private ligne(base: string, id: string): LigneChargee {
+    const l = this.depot(base).lignes().find((x) => x.id === id)
+    if (!l) throw new ErreurSchema(`Ligne introuvable : ${base}/${id}`)
+    return l
+  }
+
+  private idsCalcules(base: string, id: string, cle: string): string[] {
+    const c = this.instantane.calculs.get(base)?.get(id)?.[cle]
+    return c?.etat === 'ok' && Array.isArray(c.valeur) ? c.valeur : []
+  }
+
+  private etatBase(base: string): EtatBase {
+    const b = this.bases.get(base)
+    if (!b) throw new ErreurSchema(`Base introuvable : ${base}`)
+    return b
+  }
+
+  private vue(base: string, idVue: string): Vue {
+    const v = this.etatBase(base).vues.find((x) => x.id === idVue)
+    if (!v) throw new ErreurSchema(`Vue introuvable : ${idVue}`)
+    return v
+  }
+
+  private remplacerVues(base: string, f: (vues: Vue[]) => Vue[]) {
+    const b = this.etatBase(base)
+    this.bases.set(base, { ...b, vues: f(b.vues) })
+    this.publier()
+  }
+
+  private async chargerPages(base: string): Promise<{ pages: MiseEnPage[]; avertissements: string[] }> {
+    const dossier = joindre(base, DOSSIER_PAGES)
+    let entrees
+    try {
+      entrees = await this.adaptateur.lister(dossier)
+    } catch (e) {
+      if (e instanceof FichierIntrouvable) return { pages: [miseEnPageParDefaut()], avertissements: [] }
+      throw e
+    }
+    const pages: MiseEnPage[] = []
+    const avertissements: string[] = []
+    const noms = new Set(entrees.map((e) => e.nom))
+    for (const e of entrees) {
+      if (e.type !== 'fichier' || !e.nom.endsWith('.yaml') || copieDeConflit(e.nom, noms)) continue
+      const lue = lireMiseEnPage(await this.adaptateur.lire(joindre(dossier, e.nom)), e.nom.slice(0, -'.yaml'.length))
+      avertissements.push(...lue.avertissements)
+      if (lue.miseEnPage) pages.push(lue.miseEnPage)
+    }
+    return { pages: pages.length > 0 ? pages : [miseEnPageParDefaut()], avertissements }
+  }
+
+  private async chargerVues(base: string, ordre: readonly string[]): Promise<{ vues: Vue[]; avertissements: string[] }> {
+    const dossier = joindre(base, DOSSIER_VUES)
+    let entrees
+    try {
+      entrees = await this.adaptateur.lister(dossier)
+    } catch (e) {
+      if (e instanceof FichierIntrouvable) return { vues: [vueParDefaut()], avertissements: [] }
+      throw e
+    }
+    const vues: Vue[] = []
+    const avertissements: string[] = []
+    const noms = new Set(entrees.map((e) => e.nom))
+    for (const e of entrees) {
+      if (e.type !== 'fichier' || !e.nom.endsWith('.yaml') || copieDeConflit(e.nom, noms)) continue
+      const lue = lireVue(await this.adaptateur.lire(joindre(dossier, e.nom)), e.nom.slice(0, -'.yaml'.length))
+      avertissements.push(...lue.avertissements)
+      if (lue.vue) vues.push(lue.vue)
+    }
+    const rang = (id: string) => (ordre.includes(id) ? ordre.indexOf(id) : ordre.length)
+    vues.sort((a, b) => rang(a.id) - rang(b.id))
+    return { vues: vues.length > 0 ? vues : [vueParDefaut()], avertissements }
+  }
+
+
+  /** Écriture d'une modification déjà appliquée en mémoire : un rafraîchissement ne doit pas l'effacer entre-temps. */
+  private apresMemoire<T>(operation: () => Promise<T>): Promise<T> {
+    this.configEnVol++
+    return this.enFile(operation).finally(() => this.configEnVol--)
+  }
+
+  private enFile<T>(operation: () => Promise<T>): Promise<T> {
+    const resultat = this.file.then(operation)
+    this.file = resultat.catch(() => undefined)
+    return resultat
+  }
+
+  private schema(base: string): Schema {
+    const b = this.bases.get(base)
+    if (!b?.chargement.ok) throw new ErreurSchema(`Base introuvable : ${base}`)
+    return b.chargement.base.schema
+  }
+
+  private depot(base: string): DepotBase {
+    const d = this.bases.get(base)?.depot
+    if (!d) throw new ErreurSchema(`Base introuvable : ${base}`)
+    return d
+  }
+
+  /** Relit le fichier sur le disque, applique l'opération, réécrit (spec §4). */
+  /** Colonnes d'une base synchronisée (`source`, spec §16) : fixées par le script, pas par l'app. */
+  private refuserSiSynchronisee(base: string): void {
+    const source = this.bases.get(base)?.depot?.schema.source
+    if (source) throw new ErreurSchema(`Base synchronisée depuis ${nomSource(source.type)} : ses colonnes ne se modifient pas dans mdbase`)
+  }
+
+  private async modifierSchema(base: string, op: OperationSchema): Promise<void> {
+    const chemin = joindre(base, FICHIER_SCHEMA)
+    const texte = modifierSchema(await this.adaptateur.lire(chemin), op)
+    await this.adaptateur.ecrire(chemin, texte)
+    const { schema, avertissements } = lireSchema(texte, base)
+    const b = this.bases.get(base)
+    if (!schema || !b?.chargement.ok || !b.depot) return
+    b.depot.remplacerSchema(schema)
+    this.bases.set(base, { ...b, chargement: { ok: true, base: { ...b.chargement.base, schema, avertissements } } })
+    this.publier()
+  }
+
+  /** Le logo du thème, s'il est un SVG lisible de l'espace. */
+  private async lireLogo(): Promise<string | undefined> {
+    const chemin = this.config.theme.logo
+    const texte = chemin ? await this.lireOuNull(chemin).catch(() => null) : null
+    return texte !== null && /<svg[\s>]/i.test(texte) ? texte : undefined
+  }
+
+  private async modifierEspace(op: OperationEspace): Promise<void> {
+    const texte = modifierEspace(await this.lireOuNull(FICHIER_ESPACE), op)
+    await this.adaptateur.ecrire(FICHIER_ESPACE, texte)
+    this.config = lireEspace(texte)
+    this.publier()
+  }
+
+  private async chargerBase(id: string) {
+    const chargement = await chargerBase(this.adaptateur, id)
+    if (!chargement.ok) {
+      this.bases.set(id, { id, chargement, depot: null, vues: [], pages: [] })
+      return
+    }
+    const { vues, avertissements } = await this.chargerVues(id, chargement.base.schema.ordreVues)
+    const { pages, avertissements: avertissementsPages } = await this.chargerPages(id)
+    chargement.base.avertissements.push(...avertissements, ...avertissementsPages)
+    const depot = new DepotBase(this.adaptateur, chargement.base.schema, chargement.base.lignes, { ...this.options, journal: (c) => this.noter(c) })
+    // Toute modification de lignes peut changer les colonnes calculées de n'importe quelle base.
+    depot.abonner(() => this.publier())
+    const synchro = chargement.base.schema.source ? await this.lireSynchro(id) : undefined
+    this.bases.set(id, { id, chargement, depot, vues, pages, ...(synchro && { synchro }) })
+  }
+
+  private async lireOuNull(chemin: string): Promise<string | null> {
+    try {
+      return await this.adaptateur.lire(chemin)
+    } catch (e) {
+      if (e instanceof FichierIntrouvable) return null
+      throw e
+    }
+  }
+
+  private publier() {
+    const { groupes, horsGroupe } = barreLaterale(this.config, [...this.bases.keys()])
+    const aCalculer = new Map<string, BaseACalculer>()
+    const titres = new Map<string, Map<string, string>>()
+    const enDouble = new Map<string, Map<string, LigneChargee[]>>()
+    for (const b of this.bases.values()) {
+      if (!b.depot) continue
+      const lignes = b.depot.lignes()
+      const d = doublons(lignes)
+      if (d.size > 0) enDouble.set(b.id, d)
+      aCalculer.set(b.id, { schema: b.depot.schema, lignes })
+      const champ = b.depot.schema.champTitre
+      titres.set(b.id, new Map(lignes.map((l) => {
+        const t = l.cellules[champ]
+        return [l.id, t?.etat === 'ok' && typeof t.valeur === 'string' ? t.valeur : ''] as const
+      })))
+    }
+    const aujourdhui = this.options.aujourdhui()
+    this.recherche.synchroniser(aCalculer.values())
+    const calculs = calculer(aCalculer, { aujourdhui, maintenant: this.options.maintenant?.() ?? `${aujourdhui}T00:00` })
+    const dashboards = ordreDashboards(this.config, [...this.dashboards.keys()]).map((id) => this.dashboards.get(id)!)
+    this.instantane = { dashboards, groupes, horsGroupe, bases: new Map(this.bases), calculs, titres, doublons: enDouble, copiesConflit: this.copies, theme: { ...this.config.theme, ...(this.logoSvg && { logoSvg: this.logoSvg }) }, ...(this.config.taches && { taches: this.config.taches }) }
+    for (const fn of this.abonnes) fn()
+  }
+}
+
+export type LienVers = { base: string; chemin: string; cle: string }
+
+/** Ids d'une cellule relation stockée (vide si absente ou invalide). */
+/** Mise en page modifiée en mémoire : `contenus: null` retire la clé. */
+function avecModifs(p: MiseEnPage, modifs: ModificationMiseEnPage): MiseEnPage {
+  const { contenus, ...reste } = modifs
+  const suivante: MiseEnPage = { ...p, ...reste }
+  if (contenus === null) delete suivante.contenus
+  else if (contenus !== undefined) suivante.contenus = contenus
+  return suivante
+}
+
+function idsDe(l: LigneChargee, cle: string): string[] {
+  const c = l.cellules[cle]
+  return c?.etat === 'ok' && Array.isArray(c.valeur) ? c.valeur.map(String) : []
+}
+
+/** Égalité de contenu, pour ne remplacer que ce qui a vraiment changé. */
+function memes(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/** Champs modifiés en mémoire mais pas encore écrits : on ne les écrase pas à la relecture. */
+function enAttente(memoire: Vue, relue: Vue): Partial<Vue> {
+  return Object.fromEntries(
+    CHAMPS_MODIFIABLES.filter((k) => JSON.stringify(memoire[k]) !== JSON.stringify(relue[k])).map((k) => [k, memoire[k]]),
+  )
+}
+
+function cheminPage(base: string, id: string): string {
+  return joindre(base, DOSSIER_PAGES, `${id}.yaml`)
+}
+
+function cheminDashboard(id: string): string {
+  return joindre(DOSSIER_DASHBOARDS, `${id}.yaml`)
+}
+
+function cheminVue(base: string, idVue: string): string {
+  return joindre(base, DOSSIER_VUES, `${idVue}.yaml`)
+}
+
+function relationVers(schema: Schema, cle: string): string | undefined {
+  const c = colonne(schema, cle)
+  return c?.type === 'relation' ? c.cible : undefined
+}

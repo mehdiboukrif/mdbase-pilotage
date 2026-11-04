@@ -1,0 +1,21 @@
+node_modules
+dist
+dist-mcp
+*.tsbuildinfo
+.DS_Store
+# Graphe de code local (graphify), régénéré à chaque commit
+graphify-out/
+
+# Skills tiers en essai (npx skills add emilkowalski/skill), locaux au projet
+.claude/skills/
+skills-lock.json
+
+# Résultats du banc de l'assistant IA (npm run banc)
+banc/resultats/
+
+# App de bureau : compilation Rust et schémas générés
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Captures écrites par les tests e2e
+test-results/

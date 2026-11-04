@@ -1,0 +1,57 @@
+# App de bureau (spec §17) : installeur Windows (NSIS, sans droits administrateur),
+# non signé pour l'instant. À la demande, quand le code natif change, et en
+# release publique sur un tag bureau-v<version>.
+name: App de bureau
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['src-tauri/**', 'src/adapters/tauri/**', '.github/workflows/bureau.yml']
+    tags: ['bureau-v*']
+  pull_request:
+    paths: ['src-tauri/**', 'src/adapters/tauri/**', '.github/workflows/bureau.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: npx tauri build --bundles nsis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mdbase-windows
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+      # Version portable : l'exécutable seul, sans installation (WebView2 est déjà dans Windows 10 et 11).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mdbase-windows-portable
+          path: src-tauri/target/release/mdbase.exe
+          if-no-files-found: error
+      # Release : noms de fichiers fixes, pour un lien stable vers la dernière version (releases/latest/download/…).
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/bureau-v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${GITHUB_REF_NAME#bureau-v}"
+          test "$v" = "$(node -p "require('./package.json').version")" || { echo "Le tag $GITHUB_REF_NAME ne correspond pas à package.json"; exit 1; }
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe mdbase-windows-installeur.exe
+          cp src-tauri/target/release/mdbase.exe mdbase-windows-portable.exe
+          gh release create "$GITHUB_REF_NAME" mdbase-windows-installeur.exe mdbase-windows-portable.exe \
+            --title "mdbase $v, app de bureau Windows" --notes-file .github/release-bureau.md
